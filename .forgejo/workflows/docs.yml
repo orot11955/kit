@@ -1,0 +1,122 @@
+name: deploy-docs
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: kit-docs-production
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Validate and package site
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "${FORGEJO_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          for file in site/index.html site/styles.css site/app.js site/favicon.svg install.sh; do
+            test -s "$file"
+          done
+          grep -Fq 'kit' site/index.html
+          sh -n install.sh
+          mkdir -p .dist/site
+          cp site/index.html site/styles.css site/app.js site/favicon.svg .dist/site/
+          cp install.sh .dist/site/install.sh
+          site_marker="<meta name=\"kit-site-id\" content=\"$FORGEJO_SHA\" />"
+          awk -v marker="$site_marker" '
+            /<\/head>/ { print "    " marker; inserted++ }
+            { print }
+            END { if (inserted != 1) exit 1 }
+          ' .dist/site/index.html > .dist/site/index.html.with-id
+          mv .dist/site/index.html.with-id .dist/site/index.html
+          [[ $(grep -Fc "$site_marker" .dist/site/index.html) -eq 1 ]]
+          tar -C .dist/site -czf .dist/kit-site.tar.gz .
+
+      - name: Configure deployment SSH
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ vars.KIT_DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ vars.KIT_DEPLOY_PORT }}
+          DEPLOY_USER: ${{ vars.KIT_DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.KIT_DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.KIT_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -Eeuo pipefail
+          : "${DEPLOY_HOST:?missing KIT_DEPLOY_HOST}"
+          : "${DEPLOY_PORT:?missing KIT_DEPLOY_PORT}"
+          : "${DEPLOY_USER:?missing KIT_DEPLOY_USER}"
+          : "${DEPLOY_SSH_KEY:?missing KIT_DEPLOY_SSH_KEY}"
+          : "${DEPLOY_KNOWN_HOSTS:?missing KIT_DEPLOY_KNOWN_HOSTS}"
+          [[ "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]]
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_SSH_KEY" >"$HOME/.ssh/kit_deploy_key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" >"$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/kit_deploy_key" "$HOME/.ssh/known_hosts"
+
+      - name: Deploy current main site
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ vars.KIT_DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ vars.KIT_DEPLOY_PORT }}
+          DEPLOY_USER: ${{ vars.KIT_DEPLOY_USER }}
+        run: |
+          set -Eeuo pipefail
+          remote_head=$(git ls-remote origin refs/heads/main | awk '{print $1}')
+          [[ "$remote_head" == "$FORGEJO_SHA" ]] || {
+            echo "main advanced to $remote_head; skipping stale deployment" >&2
+            exit 1
+          }
+          ssh_options=(-i "$HOME/.ssh/kit_deploy_key" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -p "$DEPLOY_PORT")
+          ssh "${ssh_options[@]}" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "upload-site $FORGEJO_SHA" < .dist/kit-site.tar.gz
+
+      - name: Verify public site
+        shell: bash
+        env:
+          PUBLIC_BASE_URL: https://kit.2juho.com
+        run: |
+          set -Eeuo pipefail
+          curl_options=(
+            --fail --silent --show-error
+            --retry 2 --retry-delay 1 --retry-connrefused
+            --connect-timeout 5 --max-time 30
+          )
+          mkdir -p .dist/public-site
+          site_marker="<meta name=\"kit-site-id\" content=\"$FORGEJO_SHA\" />"
+          fetch_site_once() {
+            local asset url
+            for asset in index.html styles.css app.js favicon.svg install.sh; do
+              url="$PUBLIC_BASE_URL/$asset"
+              [[ $asset != index.html ]] || url="$PUBLIC_BASE_URL/"
+              curl "${curl_options[@]}" "$url" -o ".dist/public-site/$asset" || return
+              cmp -s ".dist/site/$asset" ".dist/public-site/$asset" || return
+            done
+            [[ $(grep -Fc "$site_marker" .dist/public-site/index.html) -eq 1 ]]
+          }
+          public_verified=false
+          for attempt in 1 2 3 4 5; do
+            if fetch_site_once; then
+              public_verified=true
+              break
+            fi
+            sleep $((attempt * 2))
+          done
+          [[ $public_verified == true ]] || {
+            echo "public site does not expose deployment id $FORGEJO_SHA" >&2
+            exit 1
+          }
+          echo "Public verification failure stops this workflow and never requests server rollback."
+
+      - name: Remove deployment key
+        if: always()
+        shell: bash
+        run: rm -f "$HOME/.ssh/kit_deploy_key"

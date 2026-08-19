@@ -1,0 +1,154 @@
+#!/usr/bin/env zsh
+
+setopt localoptions typesetsilent
+
+base_branch="develop"
+target_branch="work"
+limit=""
+
+for arg in "$@"; do
+  if [[ "$arg" =~ '^-[0-9]+$' ]]; then
+    limit="${arg#-}"
+  elif [[ "$arg" != -* ]]; then
+    target_branch="$arg"
+  else
+    printf "\033[31mError:\033[0m unknown option: %s\n" "$arg"
+    exit 1
+  fi
+done
+
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  printf "\033[31mError:\033[0m not inside a git repository\n"
+  exit 1
+fi
+
+if ! git rev-parse --verify "$base_branch" >/dev/null 2>&1; then
+  printf "\033[31mError:\033[0m branch '%s' not found\n" "$base_branch"
+  exit 1
+fi
+
+if ! git rev-parse --verify "$target_branch" >/dev/null 2>&1; then
+  printf "\033[31mError:\033[0m branch '%s' not found\n" "$target_branch"
+  exit 1
+fi
+
+# --------------------------------------------------
+# develop patch-id 목록
+# --------------------------------------------------
+
+develop_patches=$(
+  git log "$base_branch" --no-merges -p |
+    git patch-id --stable |
+    awk '{print $1}'
+)
+
+# --------------------------------------------------
+# target 브랜치에만 존재하는 일반 커밋
+# --------------------------------------------------
+
+commits=$(
+  git log \
+    --right-only "${base_branch}...${target_branch}" \
+    --no-merges \
+    --format='%ct %H' |
+    sort -rn |
+    awk '{print $2}'
+)
+
+if [[ -n "$limit" ]]; then
+  commits=$(printf '%s\n' "$commits" | head -n "$limit")
+fi
+
+# --------------------------------------------------
+# Colors
+# --------------------------------------------------
+
+GREEN=$'\033[32m'
+YELLOW=$'\033[33m'
+CYAN=$'\033[36m'
+MAGENTA=$'\033[35m'
+GRAY=$'\033[90m'
+BOLD=$'\033[1m'
+RESET=$'\033[0m'
+
+# --------------------------------------------------
+# Header
+# --------------------------------------------------
+
+printf "\n${BOLD}${MAGENTA}%s${RESET} ${GRAY}→ %s 비교${RESET}" \
+  "$target_branch" "$base_branch"
+
+if [[ -n "$limit" ]]; then
+  printf " ${GRAY}(최근 %s개)${RESET}" "$limit"
+fi
+
+printf "\n\n"
+
+printf "${BOLD}%-4s %-10s %-16s %s${RESET}\n" \
+  "STAT" "HASH" "DATE" "MESSAGE"
+
+printf "${GRAY}────────────────────────────────────────────────────────────────────────────────────────${RESET}\n"
+
+done_count=0
+pending_count=0
+
+# --------------------------------------------------
+# Commit status
+# --------------------------------------------------
+
+while read -r commit; do
+  [[ -z "$commit" ]] && continue
+
+  original_hash=$(git rev-parse "$commit")
+
+  patch=$(
+    git show "$commit" --format= |
+      git patch-id --stable |
+      awk '{print $1}'
+  )
+
+  short_hash=$(git rev-parse --short=8 "$commit")
+  message=$(git log -1 --format='%s' "$commit")
+  date=$(git log -1 \
+    --format='%cd' \
+    --date=format:'%Y-%m-%d %H:%M' \
+    "$commit")
+
+  # ------------------------------------------------
+  # 1. gpick -x로 cherry-pick된 원본 hash 확인
+  # ------------------------------------------------
+
+  picked_commit=$(
+    git log "$base_branch" \
+      --fixed-strings \
+      --grep="cherry picked from commit $original_hash" \
+      --format='%H' \
+      -1
+  )
+
+  # ------------------------------------------------
+  # 2. -x 기록 또는 동일 patch-id가 있으면 반영 완료
+  # ------------------------------------------------
+
+  if [[ -n "$picked_commit" ]] || grep -qx "$patch" <<< "$develop_patches"; then
+    ((done_count++))
+
+    printf "${GREEN}✓${RESET}    ${CYAN}%-10s${RESET} ${GRAY}%-16s${RESET} %s\n" \
+      "$short_hash" "$date" "$message"
+  else
+    ((pending_count++))
+
+    printf "${YELLOW}●${RESET}    ${CYAN}%-10s${RESET} ${GRAY}%-16s${RESET} %s\n" \
+      "$short_hash" "$date" "$message"
+  fi
+done <<< "$commits"
+
+# --------------------------------------------------
+# Footer
+# --------------------------------------------------
+
+printf "\n"
+printf "${GREEN}✓ %d 반영${RESET}" "$done_count"
+printf "  ${YELLOW}● %d 미반영${RESET}" "$pending_count"
+printf "  ${GRAY}│  %s → %s${RESET}\n\n" \
+  "$target_branch" "$base_branch"

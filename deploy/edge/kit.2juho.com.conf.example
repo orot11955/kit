@@ -1,0 +1,48 @@
+# /etc/nginx/sites-available/kit.2juho.com.conf 예시
+# apps-prod의 내부 IP와 인증서 경로를 운영 환경 값으로 바꾼 뒤 활성화합니다.
+
+upstream kit_origin {
+    server APPS_PROD_INTERNAL_IP:18080;
+    keepalive 8;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name kit.2juho.com;
+
+    return 301 https://kit.2juho.com$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name kit.2juho.com;
+
+    # 아래 두 경로를 현재 edge 서버의 인증서 관리 체계에 맞게 교체합니다.
+    ssl_certificate /PATH/TO/kit.2juho.com/fullchain.pem;
+    ssl_certificate_key /PATH/TO/kit.2juho.com/privkey.pem;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    client_max_body_size 1m;
+
+    location / {
+        limit_except GET {
+            deny all;
+        }
+
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 15s;
+        proxy_read_timeout 60s;
+        proxy_pass http://kit_origin;
+    }
+}

@@ -1,0 +1,330 @@
+#!/usr/bin/env zsh
+
+setopt localoptions typesetsilent
+
+BASE_BRANCH="develop"
+SOURCE_BRANCH="work"
+
+GREEN=$'\033[32m'
+YELLOW=$'\033[33m'
+CYAN=$'\033[36m'
+RED=$'\033[31m'
+GRAY=$'\033[90m'
+BOLD=$'\033[1m'
+RESET=$'\033[0m'
+
+# --------------------------------------------------
+# Arguments
+# --------------------------------------------------
+
+TARGET_BRANCH="$1"
+
+if [[ -z "$TARGET_BRANCH" ]]; then
+  echo "Usage:"
+  echo "  gpick <new-branch>"
+  echo "  gpick <new-branch> <source-branch>"
+  exit 1
+fi
+
+if [[ -n "$2" ]]; then
+  SOURCE_BRANCH="$2"
+fi
+
+# --------------------------------------------------
+# Validation
+# --------------------------------------------------
+
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  printf "${RED}Error:${RESET} not inside a git repository\n"
+  exit 1
+fi
+
+if ! command -v fzf >/dev/null 2>&1; then
+  printf "${RED}Error:${RESET} fzf가 필요합니다.\n"
+  printf "  brew install fzf\n"
+  printf "  또는 Ubuntu: sudo apt install fzf\n"
+  exit 1
+fi
+
+if ! git rev-parse --verify "$BASE_BRANCH" >/dev/null 2>&1; then
+  printf "${RED}Error:${RESET} branch '%s' not found\n" "$BASE_BRANCH"
+  exit 1
+fi
+
+if ! git rev-parse --verify "$SOURCE_BRANCH" >/dev/null 2>&1; then
+  printf "${RED}Error:${RESET} branch '%s' not found\n" "$SOURCE_BRANCH"
+  exit 1
+fi
+
+if git show-ref --verify --quiet "refs/heads/$TARGET_BRANCH"; then
+  printf "${RED}Error:${RESET} branch '%s' already exists\n" "$TARGET_BRANCH"
+  exit 1
+fi
+
+if [[ -n "$(git status --porcelain)" ]]; then
+  printf "${RED}Error:${RESET} working tree에 변경사항이 있습니다.\n"
+  printf "commit 또는 stash 후 다시 실행하세요.\n"
+  exit 1
+fi
+
+# --------------------------------------------------
+# develop patch 목록
+# --------------------------------------------------
+
+develop_patches=$(
+  git log "$BASE_BRANCH" --no-merges -p |
+    git patch-id --stable |
+    awk '{print $1}'
+)
+
+# --------------------------------------------------
+# source에만 있는 커밋 중 develop 미반영만 수집
+#
+# 반영 여부:
+# 1. -x 원본 hash가 develop commit message에 존재
+# 2. 동일 patch-id가 develop에 존재
+# --------------------------------------------------
+
+candidates=""
+
+while read -r commit; do
+  [[ -z "$commit" ]] && continue
+
+  original_hash=$(git rev-parse "$commit")
+
+  # ------------------------------------------------
+  # 1. cherry-pick -x 흔적 확인
+  # ------------------------------------------------
+
+  picked_commit=$(
+    git log "$BASE_BRANCH" \
+      --fixed-strings \
+      --grep="cherry picked from commit $original_hash" \
+      --format='%H' \
+      -1
+  )
+
+  if [[ -n "$picked_commit" ]]; then
+    continue
+  fi
+
+  # ------------------------------------------------
+  # 2. patch-id 동일 여부 확인
+  # ------------------------------------------------
+
+  patch=$(
+    git show "$commit" --format= |
+      git patch-id --stable |
+      awk '{print $1}'
+  )
+
+  if grep -qx "$patch" <<< "$develop_patches"; then
+    continue
+  fi
+
+  # ------------------------------------------------
+  # 3. 미반영 commit → 후보 추가
+  # ------------------------------------------------
+
+  short_hash=$(git rev-parse --short=8 "$commit")
+
+  date=$(git log -1 \
+    --format='%cd' \
+    --date=format:'%Y-%m-%d %H:%M' \
+    "$commit")
+
+  message=$(git log -1 --format='%s' "$commit")
+
+  candidates+="${commit}\t${short_hash}\t${date}\t${message}\n"
+
+done <<< "$(
+  git log \
+    --right-only "${BASE_BRANCH}...${SOURCE_BRANCH}" \
+    --no-merges \
+    --format='%H'
+)"
+
+if [[ -z "$candidates" ]]; then
+  printf "${GREEN}✓${RESET} 미반영 커밋이 없습니다.\n"
+  exit 0
+fi
+
+# --------------------------------------------------
+# Interactive selection
+# --------------------------------------------------
+
+selected=$(
+  printf "%b" "$candidates" |
+    fzf \
+      --multi \
+      --ansi \
+      --delimiter=$'\t' \
+      --with-nth=2,3,4 \
+      --bind='space:toggle+down' \
+      --bind='tab:toggle+down' \
+      --header="SPACE 선택/해제 · TAB 선택 후 이동 · ENTER 확정 · ESC 취소" \
+      --prompt="$SOURCE_BRANCH → $TARGET_BRANCH > " \
+      --marker="✓ " \
+      --pointer="› "
+)
+
+if [[ -z "$selected" ]]; then
+  printf "${GRAY}취소되었습니다.${RESET}\n"
+  exit 0
+fi
+
+# --------------------------------------------------
+# 선택 커밋을 오래된 순으로 정렬
+# --------------------------------------------------
+
+selected_commits=$(
+  printf "%s\n" "$selected" |
+    cut -f1 |
+    while read -r commit; do
+      timestamp=$(git show -s --format='%ct' "$commit")
+      printf "%s %s\n" "$timestamp" "$commit"
+    done |
+    sort -n |
+    awk '{print $2}'
+)
+
+count=$(printf "%s\n" "$selected_commits" | grep -c .)
+
+# --------------------------------------------------
+# Confirmation
+# --------------------------------------------------
+
+printf "\n${BOLD}새 브랜치${RESET}: ${CYAN}%s${RESET}\n" "$TARGET_BRANCH"
+printf "${BOLD}기준${RESET}:      %s\n" "$BASE_BRANCH"
+printf "${BOLD}원본${RESET}:      %s\n" "$SOURCE_BRANCH"
+printf "${BOLD}선택${RESET}:      %d commits\n\n" "$count"
+
+while read -r commit; do
+  [[ -z "$commit" ]] && continue
+
+  printf "  ${YELLOW}●${RESET} ${CYAN}%s${RESET} %s\n" \
+    "$(git rev-parse --short=8 "$commit")" \
+    "$(git log -1 --format='%s' "$commit")"
+done <<< "$selected_commits"
+
+printf "\n계속하시겠습니까? [y/N] "
+read -r answer
+
+if [[ "$answer" != "y" && "$answer" != "Y" ]]; then
+  printf "${GRAY}취소되었습니다.${RESET}\n"
+  exit 0
+fi
+
+# --------------------------------------------------
+# Create branch
+# --------------------------------------------------
+
+printf "\n${CYAN}→${RESET} %s 기준으로 %s 생성\n" \
+  "$BASE_BRANCH" "$TARGET_BRANCH"
+
+if ! git switch -c "$TARGET_BRANCH" "$BASE_BRANCH"; then
+  printf "${RED}Error:${RESET} 브랜치 생성 실패\n"
+  exit 1
+fi
+
+# --------------------------------------------------
+# Cherry-pick sequence
+# --------------------------------------------------
+
+commit_args=()
+
+while read -r commit; do
+  [[ -z "$commit" ]] && continue
+  commit_args+=("$commit")
+done <<< "$selected_commits"
+
+printf "\n${CYAN}→${RESET} %d개 커밋 cherry-pick 시작\n\n" \
+  "${#commit_args[@]}"
+
+for commit in "${commit_args[@]}"; do
+  printf "  ${YELLOW}●${RESET} ${CYAN}%s${RESET} %s\n" \
+    "$(git rev-parse --short=8 "$commit")" \
+    "$(git log -1 --format='%s' "$commit")"
+done
+
+printf "\n"
+
+# -x:
+# cherry-pick commit message에 원본 hash 기록
+#
+# (cherry picked from commit xxxxxxxxx...)
+#
+# conflict 해결 과정에서 실제 patch가 달라져도
+# ghash / gpick에서 원본 commit 반영 여부를 추적할 수 있다.
+git cherry-pick -x "${commit_args[@]}"
+result=$?
+
+# --------------------------------------------------
+# Conflict loop
+# --------------------------------------------------
+
+while [[ $result -ne 0 ]]; do
+  printf "\n${YELLOW}⚠ Cherry-pick conflict 발생${RESET}\n\n"
+
+  git status --short
+
+  printf "\n${BOLD}충돌을 에디터에서 해결한 뒤 선택하세요.${RESET}\n\n"
+
+  printf "  ${GREEN}[c]${RESET} 계속 진행\n"
+  printf "  ${YELLOW}[s]${RESET} 현재 커밋 건너뛰기\n"
+  printf "  ${RED}[a]${RESET} 전체 취소\n"
+
+  printf "\n선택 [c/s/a]: "
+
+  read -r action
+
+  case "$action" in
+
+    c|C)
+      unresolved=$(
+        git diff --name-only --diff-filter=U
+      )
+
+      if [[ -n "$unresolved" ]]; then
+        printf "\n${RED}아직 해결되지 않은 conflict가 있습니다:${RESET}\n"
+        printf "%s\n" "$unresolved"
+        printf "\n"
+        continue
+      fi
+
+      git add -A
+
+      git cherry-pick --continue
+      result=$?
+      ;;
+
+    s|S)
+      git cherry-pick --skip
+      result=$?
+      ;;
+
+    a|A)
+      git cherry-pick --abort
+
+      printf "\n${RED}✗ cherry-pick 전체 취소${RESET}\n"
+
+      exit 1
+      ;;
+
+    *)
+      printf "${RED}잘못된 선택입니다.${RESET}\n"
+      ;;
+  esac
+done
+
+# --------------------------------------------------
+# Done
+# --------------------------------------------------
+
+printf "\n${GREEN}✓ 완료${RESET}\n"
+printf "Branch: ${CYAN}%s${RESET}\n\n" "$TARGET_BRANCH"
+
+git log \
+  "$BASE_BRANCH..$TARGET_BRANCH" \
+  --oneline \
+  --no-merges

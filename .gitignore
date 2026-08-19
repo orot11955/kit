@@ -1,0 +1,7 @@
+/bin/
+/.dist/
+/deploy/apps-prod/.env
+kit-*-deploy-key
+kit-*-deploy-key.pub
+*.tmp
+.DS_Store

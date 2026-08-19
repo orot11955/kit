@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="kit — 반복하는 Git 작업을 더 빠르고 안전하게 실행하는 개인용 Go CLI"
+    />
+    <meta name="theme-color" content="#10131a" />
+    <title>kit — 익숙한 Git 작업을 더 짧게</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">본문으로 건너뛰기</a>
+
+    <header class="site-header">
+      <div class="shell header-inner">
+        <a class="brand" href="#top" aria-label="kit 문서 처음으로">
+          <span class="brand-mark" aria-hidden="true">k</span>
+          <span>kit</span>
+        </a>
+        <nav aria-label="문서 바로가기">
+          <a href="#install">설치</a>
+          <a href="#commands">명령</a>
+          <a href="#release">릴리스</a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="hero" id="top" aria-labelledby="hero-title">
+        <div class="shell hero-grid">
+          <div class="hero-copy">
+            <p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> Personal developer CLI</p>
+            <h1 id="hero-title">익숙한 Git 작업을<br /><span>더 짧고 분명하게.</span></h1>
+            <p class="hero-description">
+              <code>kit</code>은 반복해서 사용하던 shell 명령을 하나의 Go binary로 정리한 도구입니다.
+              커밋 반영 상태를 비교하고, 필요한 커밋만 골라 새 브랜치에 적용합니다.
+            </p>
+            <div class="hero-actions">
+              <a class="button button-primary" href="#install">설치하기</a>
+              <a class="button button-secondary" href="#commands">명령 살펴보기</a>
+            </div>
+          </div>
+
+          <div class="terminal-card" aria-label="kit 사용 예시">
+            <div class="terminal-bar" aria-hidden="true">
+              <span></span><span></span><span></span>
+              <p>~/workspace/project</p>
+            </div>
+            <pre><code><span class="prompt">$</span> kit compare
+
+<span class="muted">STAT  HASH      DATE              MESSAGE</span>
+<span class="success">✓</span>     329ab12f  2026-08-14 10:30  applied commit
+<span class="pending">●</span>     a137bc91  2026-08-14 11:20  pending commit
+
+<span class="prompt">$</span> kit pick feat/login --submit --wait
+<span class="muted">Select · submit MR/PR · wait for merge</span></code></pre>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="install" aria-labelledby="install-title">
+        <div class="shell">
+          <div class="section-heading">
+            <p class="section-index">01 / INSTALL</p>
+            <h2 id="install-title">한 줄로 설치합니다.</h2>
+            <p>운영체제를 자동으로 확인하고 <code>~/.local/bin/kit</code>에 설치합니다.</p>
+          </div>
+
+          <div class="install-panel">
+            <div class="code-block code-block-large">
+              <code id="install-command">curl -fsSL https://kit.2juho.com/install.sh | sh</code>
+              <button class="copy-button" type="button" data-copy-target="install-command" aria-label="설치 명령 복사">
+                <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M8 7V5a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-2M5 8h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2Z" /></svg>
+                <span>복사</span>
+              </button>
+            </div>
+            <p class="install-note">
+              설치 script는 platform 확인, binary 다운로드, SHA-256 검증과 PATH 설정만 수행합니다.
+              실행 중 필요한 외부 도구는 시스템의 <code>git</code>뿐입니다.
+            </p>
+          </div>
+
+          <div class="support-grid" aria-label="공식 지원 환경">
+            <article class="support-card">
+              <div class="os-icon" aria-hidden="true">⌘</div>
+              <div>
+                <h3>macOS</h3>
+                <p>Apple Silicon · <code>darwin/arm64</code></p>
+                <span class="support-tag">Intel Mac 제외</span>
+              </div>
+            </article>
+            <article class="support-card">
+              <div class="os-icon ubuntu" aria-hidden="true">◉</div>
+              <div>
+                <h3>Ubuntu 24.04 LTS</h3>
+                <p>x86-64 · <code>linux/amd64</code></p>
+                <span class="support-tag">공식 지원</span>
+              </div>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="section section-tinted" id="commands" aria-labelledby="commands-title">
+        <div class="shell">
+          <div class="section-heading">
+            <p class="section-index">02 / COMMANDS</p>
+            <h2 id="commands-title">반복 작업을 명확한 명령으로.</h2>
+            <p>Git의 동작과 기록을 그대로 유지하면서 선택과 확인 과정을 간결하게 만듭니다.</p>
+          </div>
+
+          <div class="command-list">
+            <article class="command-card">
+              <div class="command-number" aria-hidden="true">01</div>
+              <div class="command-content">
+                <div class="command-title-row">
+                  <h3><code>kit compare</code></h3>
+                  <span class="badge badge-read">READ ONLY</span>
+                </div>
+                <p>
+                  source의 커밋이 base에 반영됐는지 <code>cherry-pick -x</code> 기록과
+                  stable patch-id로 비교합니다. 기본 source는 <code>work</code>, base는
+                  <code>develop</code>입니다.
+                </p>
+                <div class="code-block">
+                  <code id="compare-command">kit compare work --base develop --limit 10</code>
+                  <button class="copy-button icon-only" type="button" data-copy-target="compare-command" aria-label="compare 예시 복사">
+                    <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M8 7V5a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-2M5 8h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2Z" /></svg>
+                  </button>
+                </div>
+              </div>
+            </article>
+
+            <article class="command-card">
+              <div class="command-number" aria-hidden="true">02</div>
+              <div class="command-content">
+                <div class="command-title-row">
+                  <h3><code>kit pick</code></h3>
+                  <span class="badge badge-write">GIT WRITE</span>
+                </div>
+                <p>
+                  source의 미반영 커밋을 내장 fuzzy UI에서 여러 개 선택합니다. base에서 새
+                  브랜치를 만든 뒤 부모 쪽 커밋부터 <code>git cherry-pick -x</code>로 적용합니다.
+                </p>
+                <div class="code-block">
+                  <code id="pick-command">kit pick feat/login --from work --base develop --submit</code>
+                  <button class="copy-button icon-only" type="button" data-copy-target="pick-command" aria-label="pick 예시 복사">
+                    <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M8 7V5a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-2M5 8h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2Z" /></svg>
+                  </button>
+                </div>
+                <p class="key-help"><kbd>space</kbd> 선택 · <kbd>enter</kbd> 확인 · <kbd>esc</kbd> 취소</p>
+              </div>
+            </article>
+
+            <article class="command-card compact-command">
+              <div class="command-number" aria-hidden="true">03</div>
+              <div class="command-content">
+                <div class="command-title-row"><h3><code>kit git status</code></h3></div>
+                <p>main, develop, work 역할과 로컬·원격 동기화 상태를 한 번에 확인합니다.</p>
+              </div>
+            </article>
+
+            <article class="command-card compact-command">
+              <div class="command-number" aria-hidden="true">04</div>
+              <div class="command-content">
+                <div class="command-title-row"><h3><code>kit git sync</code></h3></div>
+                <p>develop을 fast-forward하고 work를 미반영 커밋만으로 안전하게 재구성합니다.</p>
+              </div>
+            </article>
+
+            <article class="command-card compact-command">
+              <div class="command-number" aria-hidden="true">05</div>
+              <div class="command-content">
+                <div class="command-title-row"><h3><code>kit git review</code></h3></div>
+                <p>GitLab MR·Forgejo PR을 생성하고 merge 확인, work 동기화와 로컬 브랜치 정리까지 이어갑니다.</p>
+              </div>
+            </article>
+
+            <article class="command-card compact-command">
+              <div class="command-number" aria-hidden="true">06</div>
+              <div class="command-content">
+                <div class="command-title-row"><h3><code>kit update</code></h3></div>
+                <p>최신 릴리스를 확인하고 checksum 검증 후 현재 binary를 안전하게 교체합니다.</p>
+              </div>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="release" aria-labelledby="release-title">
+        <div class="shell release-layout">
+          <div>
+            <div class="section-heading release-heading">
+              <p class="section-index">03 / RELEASE</p>
+              <h2 id="release-title">현재 릴리스</h2>
+              <p>main의 문서는 항상 최신 상태로 배포되고, version tag가 binary 릴리스를 갱신합니다.</p>
+            </div>
+
+            <div class="release-card" aria-live="polite" aria-busy="false" id="release-card">
+              <div class="release-topline">
+                <span class="release-version" id="release-version">첫 릴리스 준비 중</span>
+                <span class="release-state" id="release-state">metadata 미연결</span>
+              </div>
+              <dl class="release-meta">
+                <div><dt>Build</dt><dd id="release-build">—</dd></div>
+                <div><dt>Published</dt><dd id="release-published">—</dd></div>
+              </dl>
+              <div class="change-notes">
+                <h3>변경 내용</h3>
+                <ul id="release-notes">
+                  <li><code>kit compare</code>로 커밋 반영 상태를 비교합니다.</li>
+                  <li><code>kit pick</code>의 내장 fuzzy UI에서 적용할 커밋을 선택합니다.</li>
+                  <li><code>kit git sync</code>가 협업 변경을 반영하고 work를 안전하게 재구성합니다.</li>
+                  <li><code>kit git review</code>가 MR/PR 생성부터 merge 후 정리까지 관리합니다.</li>
+                  <li><code>kit update</code>가 checksum 검증 후 binary를 갱신합니다.</li>
+                </ul>
+              </div>
+            </div>
+          </div>
+
+          <aside class="download-panel" aria-labelledby="download-title">
+            <p class="detected-platform" id="detected-platform">환경을 확인하고 있습니다.</p>
+            <h3 id="download-title">직접 다운로드</h3>
+            <p id="download-guidance">
+              릴리스 metadata에서 검증된 artifact 주소를 불러옵니다. 일반 설치에는 위 설치 명령을 권장합니다.
+            </p>
+            <div class="download-actions" id="download-actions">
+              <span class="button download-button is-disabled" aria-disabled="true">릴리스 정보 확인 중</span>
+            </div>
+            <noscript>
+              <p class="noscript-note">
+                JavaScript가 꺼져 있어 직접 다운로드 링크를 표시할 수 없습니다.
+                <a href="/release.json">release.json</a>에서 artifact와 checksum을 확인하세요.
+              </p>
+            </noscript>
+            <div class="update-callout">
+              <span aria-hidden="true">↻</span>
+              <p>이미 설치했다면<br /><code>kit update</code></p>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <section class="workflow" aria-labelledby="workflow-title">
+        <div class="shell workflow-inner">
+          <div>
+            <p class="section-index">HOW IT SHIPS</p>
+            <h2 id="workflow-title">코드는 바뀌고,<br />설치는 그대로 간단합니다.</h2>
+          </div>
+          <ol class="workflow-steps">
+            <li><span>1</span><div><strong>main 반영</strong><p>기능 문서가 자동으로 갱신됩니다.</p></div></li>
+            <li><span>2</span><div><strong>version tag</strong><p>지원 OS용 Go binary를 빌드합니다.</p></div></li>
+            <li><span>3</span><div><strong>검증 후 전환</strong><p>checksum과 metadata를 함께 배포합니다.</p></div></li>
+          </ol>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="shell footer-inner">
+        <p><span class="brand-mark small" aria-hidden="true">k</span> kit</p>
+        <p>Built for repeatable development work.</p>
+      </div>
+    </footer>
+
+    <div class="toast" id="copy-toast" role="status" aria-live="polite" aria-atomic="true"></div>
+  </body>
+</html>

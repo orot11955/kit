@@ -1,0 +1,163 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: kit-release-production
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout tagged source
+        uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release input and runner
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$FORGEJO_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          [[ "$FORGEJO_SHA" =~ ^[0-9a-f]{40}$ ]]
+          tag_commit=$(git rev-parse "${FORGEJO_REF_NAME}^{commit}")
+          [[ "$tag_commit" =~ ^[0-9a-f]{40}$ ]]
+          git show-ref --verify --quiet refs/remotes/origin/main || {
+            echo 'origin/main is unavailable; full branch history is required for release validation' >&2
+            exit 1
+          }
+          git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main || {
+            echo "release tag $FORGEJO_REF_NAME is not contained in origin/main" >&2
+            exit 1
+          }
+          [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]]
+          go version
+          [[ "$(go env GOVERSION)" =~ ^go([0-9]+)\.([0-9]+) ]]
+          (( BASH_REMATCH[1] > 1 || (BASH_REMATCH[1] == 1 && BASH_REMATCH[2] >= 23) ))
+          git --version
+          sha256sum --version | head -n 1
+
+      - name: Test
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          go vet ./...
+          go test ./...
+
+      - name: Build release binaries and metadata
+        shell: bash
+        env:
+          PUBLIC_BASE_URL: https://kit.2juho.com
+        run: |
+          set -Eeuo pipefail
+          version="$FORGEJO_REF_NAME"
+          commit=$(git rev-parse "${FORGEJO_REF_NAME}^{commit}")
+          published_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          ldflags="-s -w -X kit/internal/buildinfo.Version=$version -X kit/internal/buildinfo.Commit=$commit -X kit/internal/buildinfo.BuildDate=$published_at"
+          mkdir -p .dist/release
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$ldflags" \
+            -o .dist/release/kit_darwin_arm64 ./cmd/kit
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$ldflags" \
+            -o .dist/release/kit_linux_amd64 ./cmd/kit
+          (
+            cd .dist/release
+            sha256sum kit_darwin_arm64 kit_linux_amd64 >checksums.txt
+          )
+          deploy/generate-release-metadata.sh .dist/release "$version" "$commit" "$published_at" "$PUBLIC_BASE_URL"
+
+          linux_version=$(.dist/release/kit_linux_amd64 version)
+          grep -Fq "$version" <<<"$linux_version"
+          grep -Fq "$commit" <<<"$linux_version"
+          grep -Fq 'linux/amd64' <<<"$linux_version"
+          echo "Darwin/arm64 binary is cross-compiled on Linux and cannot be executed by this runner."
+
+          tar -C .dist/release -czf .dist/kit-release.tar.gz .
+
+      - name: Configure deployment SSH
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ vars.KIT_DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ vars.KIT_DEPLOY_PORT }}
+          DEPLOY_USER: ${{ vars.KIT_DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.KIT_DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.KIT_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -Eeuo pipefail
+          : "${DEPLOY_HOST:?missing KIT_DEPLOY_HOST}"
+          : "${DEPLOY_PORT:?missing KIT_DEPLOY_PORT}"
+          : "${DEPLOY_USER:?missing KIT_DEPLOY_USER}"
+          : "${DEPLOY_SSH_KEY:?missing KIT_DEPLOY_SSH_KEY}"
+          : "${DEPLOY_KNOWN_HOSTS:?missing KIT_DEPLOY_KNOWN_HOSTS}"
+          [[ "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]]
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_SSH_KEY" >"$HOME/.ssh/kit_deploy_key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" >"$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/kit_deploy_key" "$HOME/.ssh/known_hosts"
+
+      - name: Deploy immutable release
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ vars.KIT_DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ vars.KIT_DEPLOY_PORT }}
+          DEPLOY_USER: ${{ vars.KIT_DEPLOY_USER }}
+        run: |
+          set -Eeuo pipefail
+          ssh_options=(-i "$HOME/.ssh/kit_deploy_key" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -p "$DEPLOY_PORT")
+          ssh "${ssh_options[@]}" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "upload-release $FORGEJO_REF_NAME" < .dist/kit-release.tar.gz
+
+      - name: Verify public release
+        shell: bash
+        env:
+          PUBLIC_BASE_URL: https://kit.2juho.com
+        run: |
+          set -Eeuo pipefail
+          curl_options=(
+            --fail --silent --show-error
+            --retry 2 --retry-delay 1 --retry-connrefused
+            --connect-timeout 5 --max-time 120
+          )
+          mkdir -p .dist/public-release
+          fetch_exact() {
+            local expected=$1
+            local url=$2
+            local output=$3
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              if curl "${curl_options[@]}" "$url" -o "$output" && cmp -s "$expected" "$output"; then
+                return
+              fi
+              sleep $((attempt * 2))
+            done
+            echo "public content does not match: $url" >&2
+            return 1
+          }
+
+          fetch_exact .dist/release/version.txt \
+            "$PUBLIC_BASE_URL/version.txt" .dist/public-release/version.txt
+          fetch_exact .dist/release/release.json \
+            "$PUBLIC_BASE_URL/release.json" .dist/public-release/release.json
+          fetch_exact .dist/release/checksums.txt \
+            "$PUBLIC_BASE_URL/downloads/$FORGEJO_REF_NAME/checksums.txt" \
+            .dist/public-release/checksums.txt
+          for artifact in kit_darwin_arm64 kit_linux_amd64; do
+            fetch_exact ".dist/release/$artifact" \
+              "$PUBLIC_BASE_URL/downloads/$FORGEJO_REF_NAME/$artifact" \
+              ".dist/public-release/$artifact"
+          done
+
+          (
+            cd .dist/public-release
+            sha256sum -c checksums.txt
+          )
+          echo "Public verification failure stops this workflow and never requests server rollback."
+
+      - name: Remove deployment key
+        if: always()
+        shell: bash
+        run: rm -f "$HOME/.ssh/kit_deploy_key"

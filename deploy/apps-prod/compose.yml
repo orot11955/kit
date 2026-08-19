@@ -1,0 +1,31 @@
+name: kit
+
+services:
+  kit-origin:
+    image: nginx:1.30.4-alpine@sha256:97d490c12ba55b4946b01546d1c3ed324e8d41ab1c9fcb2a616aa470620e5b46
+    container_name: kit-origin
+    restart: unless-stopped
+    ports:
+      - "${KIT_ORIGIN_BIND:?set KIT_ORIGIN_BIND to the apps-prod private IP}:${KIT_ORIGIN_PORT:-18080}:8080"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./data:/srv/kit:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    user: "101:101"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
