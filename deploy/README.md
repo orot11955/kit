@@ -9,7 +9,7 @@ Cloudflare DNS-only
   -> /srv/data/apps/kit/data
 ```
 
-Forgejo가 없어도 같은 forced-command SSH 경로로 수동 배포할 수 있다. 자동 workflow와
+Gitea가 없어도 같은 forced-command SSH 경로로 수동 배포할 수 있다. 자동 workflow와
 수동 배포의 차이는 archive를 누가 만드는지뿐이며, 서버의 검증·원자적 symlink 전환·보존
 정책은 같다. 실제 수동 빌드와 업로드는 [MANUAL_DEPLOY.md](./MANUAL_DEPLOY.md)를 따른다.
 
@@ -17,7 +17,7 @@ Forgejo가 없어도 같은 forced-command SSH 경로로 수동 배포할 수 �
 
 1. apps-prod의 `kit-activate`: root 관리 설정에 지정된 origin HTTP 응답을 배포 파일과 byte
    단위로 비교한다. 이 단계가 실패할 때만 활성 symlink를 자동 복원한다.
-2. 수동 배포자 또는 Forgejo workflow: activation 성공 후 public HTTPS 전체 경로를
+2. 수동 배포자 또는 Gitea workflow: activation 성공 후 public HTTPS 전체 경로를
    검증한다. public 실패는 배포 작업을 실패로 끝낼 뿐 자동 rollback을 호출하지 않는다.
 
 현재 edge→apps-prod origin 구간은 신뢰된 사설망의 평문 HTTP를 전제로 한다. 이 구간에서
@@ -121,9 +121,9 @@ sudo chmod 0644 /etc/kit/deploy.env
 shell quote나 공백을 넣지 않는다. origin 요청은 proxy 환경과 curl 사용자 설정을 사용하지
 않고, 기대 파일 크기를 초과하는 응답을 중단한다.
 
-### manual key와 Forgejo Runner key 분리
+### manual key와 Gitea Runner key 분리
 
-수동 배포와 Forgejo Runner는 같은 private key를 공유하지 않는다. 각 위치에서 별도
+수동 배포와 Gitea Runner는 같은 private key를 공유하지 않는다. 각 위치에서 별도
 Ed25519 keypair를 만들고 public fingerprint를 기록한다.
 
 ```sh
@@ -133,23 +133,23 @@ MANUAL_KEY_DIR=$(mktemp -d)
 ssh-keygen -t ed25519 -f "$MANUAL_KEY_DIR/kit-manual-deploy-key" -C kit-manual-deploy
 ssh-keygen -lf "$MANUAL_KEY_DIR/kit-manual-deploy-key.pub" -E sha256
 
-# 보안 관리 host에서 Runner용 key를 별도로 생성한 뒤 Forgejo secret으로 등록
-FORGEJO_KEY_DIR=$(mktemp -d)
-ssh-keygen -t ed25519 -f "$FORGEJO_KEY_DIR/kit-forgejo-deploy-key" -C kit-forgejo-deploy
-ssh-keygen -lf "$FORGEJO_KEY_DIR/kit-forgejo-deploy-key.pub" -E sha256
+# 보안 관리 host에서 Runner용 key를 별도로 생성한 뒤 Gitea secret으로 등록
+GITEA_KEY_DIR=$(mktemp -d)
+ssh-keygen -t ed25519 -f "$GITEA_KEY_DIR/kit-gitea-deploy-key" -C kit-gitea-deploy
+ssh-keygen -lf "$GITEA_KEY_DIR/kit-gitea-deploy-key.pub" -E sha256
 ```
 
 두 임시 directory는 checkout 밖에 생성된다. Runner private key는
 `KIT_DEPLOY_SSH_KEY` secret 등록과 public key fingerprint 확인이 끝난 뒤 관리 host에서
-삭제한다. manual private key는 수동 배포 기간에만 보관하고 Forgejo secret에 등록하지
+삭제한다. manual private key는 수동 배포 기간에만 보관하고 Gitea secret에 등록하지
 않는다.
 
 두 public key를 각각 다른 `authorized_keys` line에 추가한다. `MANUAL_BUILD_IP`와
-`FORGEJO_RUNNER_IP`도 서로의 실제 source IP로 제한한다.
+`GITEA_RUNNER_IP`도 서로의 실제 source IP로 제한한다.
 
 ```text
 from="MANUAL_BUILD_IP",restrict,command="/usr/local/libexec/kit-ssh-wrapper manual" ssh-ed25519 AAAA... kit-manual-deploy
-from="FORGEJO_RUNNER_IP",restrict,command="/usr/local/libexec/kit-ssh-wrapper forgejo" ssh-ed25519 AAAA... kit-forgejo-deploy
+from="GITEA_RUNNER_IP",restrict,command="/usr/local/libexec/kit-ssh-wrapper gitea" ssh-ed25519 AAAA... kit-gitea-deploy
 ```
 
 wrapper는 `upload-site <40 hex>`와 `upload-release <SemVer>`만 허용하고 표준 입력 archive를
@@ -164,13 +164,66 @@ fingerprint를 다시 비교한다. 계정에 sudo, Docker socket, 다른 `/srv/
 sudo ssh-keygen -lf /home/kit-deploy/.ssh/authorized_keys -E sha256
 ```
 
-출력된 각 comment와 SHA256 fingerprint가 manual/Forgejo의 `.pub` 출력과 각각 일치해야
+출력된 각 comment와 SHA256 fingerprint가 manual/Gitea의 `.pub` 출력과 각각 일치해야
 한다. `.deploy.lock`과 `.upload.lock`은 위 설치 단계처럼 `kit-deploy:kit-deploy`, mode
 `0600`을 유지한다. rollback 요청은 root 전용 `kit-rollback`에서 검증하지만 activator
 자체는 즉시 `kit-deploy` 권한으로 낮춰 실행한다. activator도 이 UID가 아니면 실행을
 거부한다. 따라서 rollback과 SSH 배포가 같은 사용 권한과 lock inode를 사용하며, rollback은
 `.upload.lock` 다음 `.deploy.lock` 순서로 획득해 진행 중 upload가 나중에 결과를 덮는 것을
 막는다.
+
+### Gitea Actions와 Runner 연결
+
+kit repository에서 Actions를 활성화하고 홈 Gitea instance에 역할이 다른 Runner를
+등록한다. PR을 검사하는 `kit-ci` Runner와 배포 secret을 사용하는 `kit-deploy` Runner는
+서로 다른 OS account, work directory, cache, 등록 token과 network 권한을 사용해야 한다.
+둘 다 Ubuntu 24.04 amd64 환경으로 운영하되 `runs-on` label이 workflow와 정확히 일치해야
+한다. 회사 Gitea와 개인 Gitea 사이에도 token, Runner 등록 token, cache와 배포 SSH key를
+공유하지 않는다.
+
+- `kit-ci`: `pull_request`와 일반 branch 검사 전용. 배포 secret과 apps-prod 접근 권한이
+  없으며 가능한 경우 job마다 폐기되는 ephemeral Runner로 운영한다.
+- `kit-deploy`: 보호된 `main` push와 보호된 `v*` tag 배포 전용. PR workflow를 받지 않고
+  apps-prod의 forced-command SSH endpoint에만 접근한다.
+
+Runner label은 작업 routing 수단일 뿐 권한 경계가 아니다. 이 구성은 홈의 kit source
+repository에 배포 책임자만 same-repository branch write 권한을 갖는 것을 전제로 한다.
+외부 기여자는 fork PR만 사용하고, fork workflow 실행을 승인하기 전에
+`.gitea/workflows/` 변경 여부를 먼저 검토한다. 회사 Gitea repository에는 아래 kit 배포
+secret과 `kit-deploy` Runner를 등록하지 않는다.
+
+다른 개발자에게 kit source repository의 branch write 권한을 줄 계획이라면 repository
+secret을 등록하기 전에 배포 workflow와 SSH key를 PR을 받지 않는 별도 deployment
+repository/Gitea scope로 분리해야 한다. 현재 Gitea의 Runner label만으로 feature branch가
+`kit-deploy`를 요청하지 못하게 강제된다고 가정하지 않는다.
+
+Gitea repository의 `main`은 direct push를 차단하고 PR 승인과 `ci` 상태 검사를 요구한다.
+`v*` tag 생성 권한은 release 담당자 또는 전용 자동화 주체로 제한한다. 이 보호 규칙을
+적용하기 전에는 docs/release workflow를 활성화하거나 배포 secret을 등록하지 않는다.
+
+repository Actions 설정에는 다음 값을 등록한다.
+
+```text
+Variables
+  KIT_DEPLOY_HOST       apps-prod의 Runner 접근용 사설 주소
+  KIT_DEPLOY_PORT       기본 22 또는 실제 SSH port
+  KIT_DEPLOY_USER       kit-deploy
+
+Secrets
+  KIT_DEPLOY_SSH_KEY    Gitea Runner 전용 private key
+  KIT_DEPLOY_KNOWN_HOSTS  별도 경로로 fingerprint를 확인한 apps-prod host key line
+```
+
+workflow는 `.gitea/workflows/`에서 읽으며 `main` push는 docs, `vX.Y.Z` tag push는 release를
+배포한다. `GITHUB_SHA`와 `GITHUB_REF_NAME`은 Gitea Actions가 제공하는 호환 환경 변수를
+사용한다. checkout action은 Gitea 공식 mirror의 검증한 commit SHA로 고정되어 있으므로
+갱신할 때 tag 이름만 바꾸지 말고 새 tag가 가리키는 commit과 release 내용을 함께 확인한다.
+
+기존 Forgejo forced-command key를 전환하는 동안 wrapper는 `forgejo` identity를 레거시로
+허용한다. 먼저 `gitea` identity의 새 public key를 추가하고 Gitea workflow의 SSH 연결을
+검증한 뒤, 기존 Forgejo key line과 secret을 제거한다. manual key는 이 전환과 무관하게
+별도로 유지한다. 제거 후 `authorized_keys` fingerprint를 다시 기록하고 system log에 더
+이상 `identity=forgejo` 또는 의도하지 않은 `identity=legacy` 요청이 없는지 확인한다.
 
 ### 방화벽
 

@@ -11,10 +11,10 @@ concurrency:
 
 jobs:
   build-and-deploy:
-    runs-on: ubuntu-24.04
+    runs-on: kit-deploy
     steps:
       - name: Checkout tagged source
-        uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: https://gitea.com/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -23,16 +23,16 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          [[ "$FORGEJO_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
-          [[ "$FORGEJO_SHA" =~ ^[0-9a-f]{40}$ ]]
-          tag_commit=$(git rev-parse "${FORGEJO_REF_NAME}^{commit}")
+          [[ "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          tag_commit=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
           [[ "$tag_commit" =~ ^[0-9a-f]{40}$ ]]
           git show-ref --verify --quiet refs/remotes/origin/main || {
             echo 'origin/main is unavailable; full branch history is required for release validation' >&2
             exit 1
           }
           git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main || {
-            echo "release tag $FORGEJO_REF_NAME is not contained in origin/main" >&2
+            echo "release tag $GITHUB_REF_NAME is not contained in origin/main" >&2
             exit 1
           }
           [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]]
@@ -55,8 +55,8 @@ jobs:
           PUBLIC_BASE_URL: https://kit.2juho.com
         run: |
           set -Eeuo pipefail
-          version="$FORGEJO_REF_NAME"
-          commit=$(git rev-parse "${FORGEJO_REF_NAME}^{commit}")
+          version="$GITHUB_REF_NAME"
+          commit=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
           published_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           ldflags="-s -w -X kit/internal/buildinfo.Version=$version -X kit/internal/buildinfo.Commit=$commit -X kit/internal/buildinfo.BuildDate=$published_at"
           mkdir -p .dist/release
@@ -109,7 +109,7 @@ jobs:
           set -Eeuo pipefail
           ssh_options=(-i "$HOME/.ssh/kit_deploy_key" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -p "$DEPLOY_PORT")
           ssh "${ssh_options[@]}" "$DEPLOY_USER@$DEPLOY_HOST" \
-            "upload-release $FORGEJO_REF_NAME" < .dist/kit-release.tar.gz
+            "upload-release $GITHUB_REF_NAME" < .dist/kit-release.tar.gz
 
       - name: Verify public release
         shell: bash
@@ -143,11 +143,11 @@ jobs:
           fetch_exact .dist/release/release.json \
             "$PUBLIC_BASE_URL/release.json" .dist/public-release/release.json
           fetch_exact .dist/release/checksums.txt \
-            "$PUBLIC_BASE_URL/downloads/$FORGEJO_REF_NAME/checksums.txt" \
+            "$PUBLIC_BASE_URL/downloads/$GITHUB_REF_NAME/checksums.txt" \
             .dist/public-release/checksums.txt
           for artifact in kit_darwin_arm64 kit_linux_amd64; do
             fetch_exact ".dist/release/$artifact" \
-              "$PUBLIC_BASE_URL/downloads/$FORGEJO_REF_NAME/$artifact" \
+              "$PUBLIC_BASE_URL/downloads/$GITHUB_REF_NAME/$artifact" \
               ".dist/public-release/$artifact"
           done
 

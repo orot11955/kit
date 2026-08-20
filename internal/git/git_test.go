@@ -70,10 +70,12 @@ func TestGitEnvironmentRemovesKitProviderTokens(t *testing.T) {
 		"PATH=/usr/bin",
 		"KIT_GITLAB_TOKEN=gitlab-secret",
 		"KIT_FORGEJO_TOKEN=forgejo-secret",
+		"KIT_GITEA_TOKEN=gitea-secret",
+		"KIT_GITEA_HOST=gitea.example",
 		"KIT_GITLAB_HOST=gitlab.example",
 		"UNRELATED_TOKEN=kept",
 	})
-	want := []string{"PATH=/usr/bin", "KIT_GITLAB_HOST=gitlab.example", "UNRELATED_TOKEN=kept"}
+	want := []string{"PATH=/usr/bin", "KIT_GITEA_HOST=gitea.example", "KIT_GITLAB_HOST=gitlab.example", "UNRELATED_TOKEN=kept"}
 	if len(got) != len(want) {
 		t.Fatalf("unexpected environment: %#v", got)
 	}

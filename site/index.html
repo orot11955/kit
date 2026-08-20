@@ -57,7 +57,7 @@
 <span class="success">✓</span>     329ab12f  2026-08-14 10:30  applied commit
 <span class="pending">●</span>     a137bc91  2026-08-14 11:20  pending commit
 
-<span class="prompt">$</span> kit pick feat/login --submit --wait
+<span class="prompt">$</span> kit pick feat/login --wait
 <span class="muted">Select · submit MR/PR · wait for merge</span></code></pre>
           </div>
         </div>
@@ -144,11 +144,11 @@
                   <span class="badge badge-write">GIT WRITE</span>
                 </div>
                 <p>
-                  source의 미반영 커밋을 내장 fuzzy UI에서 여러 개 선택합니다. base에서 새
-                  브랜치를 만든 뒤 부모 쪽 커밋부터 <code>git cherry-pick -x</code>로 적용합니다.
+                  최신 develop을 확인한 뒤 source의 미반영 커밋을 내장 fuzzy UI에서 선택합니다.
+                  새 브랜치에 적용하고 push와 Gitea PR 생성까지 한 번에 처리합니다.
                 </p>
                 <div class="code-block">
-                  <code id="pick-command">kit pick feat/login --from work --base develop --submit</code>
+                  <code id="pick-command">kit pick feat/login</code>
                   <button class="copy-button icon-only" type="button" data-copy-target="pick-command" aria-label="pick 예시 복사">
                     <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M8 7V5a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-2M5 8h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2Z" /></svg>
                   </button>
@@ -160,24 +160,24 @@
             <article class="command-card compact-command">
               <div class="command-number" aria-hidden="true">03</div>
               <div class="command-content">
-                <div class="command-title-row"><h3><code>kit git status</code></h3></div>
-                <p>main, develop, work 역할과 로컬·원격 동기화 상태를 한 번에 확인합니다.</p>
+                <div class="command-title-row"><h3><code>kit status</code></h3></div>
+                <p>main, develop, work와 진행 중인 Gitea PR 상태를 한 화면에서 확인합니다. 서버가 느리면 <code>--cached</code>로 즉시 확인할 수 있습니다.</p>
               </div>
             </article>
 
             <article class="command-card compact-command">
               <div class="command-number" aria-hidden="true">04</div>
               <div class="command-content">
-                <div class="command-title-row"><h3><code>kit git sync</code></h3></div>
-                <p>develop을 fast-forward하고 work를 미반영 커밋만으로 안전하게 재구성합니다.</p>
+                <div class="command-title-row"><h3><code>kit sync</code></h3></div>
+                <p>merge를 확인하고 develop/work 갱신과 로컬 review 브랜치 정리를 처리합니다.</p>
               </div>
             </article>
 
             <article class="command-card compact-command">
               <div class="command-number" aria-hidden="true">05</div>
               <div class="command-content">
-                <div class="command-title-row"><h3><code>kit git review</code></h3></div>
-                <p>GitLab MR·Forgejo PR을 생성하고 merge 확인, work 동기화와 로컬 브랜치 정리까지 이어갑니다.</p>
+                <div class="command-title-row"><h3><code>kit review</code></h3></div>
+                <p>여러 review의 조회, 대기 또는 개별 복구가 필요할 때 사용하는 고급 명령입니다.</p>
               </div>
             </article>
 
@@ -215,8 +215,8 @@
                 <ul id="release-notes">
                   <li><code>kit compare</code>로 커밋 반영 상태를 비교합니다.</li>
                   <li><code>kit pick</code>의 내장 fuzzy UI에서 적용할 커밋을 선택합니다.</li>
-                  <li><code>kit git sync</code>가 협업 변경을 반영하고 work를 안전하게 재구성합니다.</li>
-                  <li><code>kit git review</code>가 MR/PR 생성부터 merge 후 정리까지 관리합니다.</li>
+                  <li><code>kit sync</code>가 merge 확인, 협업 변경 반영과 work 재구성을 처리합니다.</li>
+                  <li><code>kit review</code>는 review 대기와 개별 복구가 필요할 때 사용합니다.</li>
                   <li><code>kit update</code>가 checksum 검증 후 binary를 갱신합니다.</li>
                 </ul>
               </div>

@@ -36,6 +36,44 @@ func TestParsePickRequiresOneTarget(t *testing.T) {
 	}
 }
 
+func TestParsePickSubmitsByDefaultAndLocalOptOut(t *testing.T) {
+	defaultOptions, _, err := parsePick(globalOptions{cwd: "."}, []string{"feat/default"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !defaultOptions.submit || defaultOptions.localOnly {
+		t.Fatalf("pick should submit by default: %#v", defaultOptions)
+	}
+	localOptions, _, err := parsePick(globalOptions{cwd: "."}, []string{"feat/local", "--local"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if localOptions.submit || !localOptions.localOnly {
+		t.Fatalf("--local should disable submit: %#v", localOptions)
+	}
+}
+
+func TestDefaultPickRejectsCustomWorkflowWithoutLocal(t *testing.T) {
+	dir := appRepository(t)
+	gitCommand(t, dir, "branch", "work")
+	selected := false
+	a := &Application{
+		IO:    IO{In: strings.NewReader(""), Out: io.Discard, ErrOut: io.Discard},
+		Build: buildinfo.Current(),
+		Select: func(items []selector.Item, _ string) ([]selector.Item, error) {
+			selected = true
+			return items, nil
+		},
+	}
+	err := a.Run(context.Background(), []string{"pick", "feat/custom", "--from", "other-work", "--cwd", dir})
+	if clierror.Code(err) != clierror.Usage || !strings.Contains(err.Error(), "--local") {
+		t.Fatalf("expected early custom workflow guidance, got %v", err)
+	}
+	if selected {
+		t.Fatal("selector opened before rejecting unsupported custom submit workflow")
+	}
+}
+
 func TestVersionJSON(t *testing.T) {
 	var output bytes.Buffer
 	a := &Application{
@@ -51,6 +89,28 @@ func TestVersionJSON(t *testing.T) {
 	}
 	if got != a.Build {
 		t.Fatalf("got %#v, want %#v", got, a.Build)
+	}
+}
+
+func TestTopLevelStatusAndBackupCommandsUseCanonicalUI(t *testing.T) {
+	dir := appRepository(t)
+	gitCommand(t, dir, "branch", "work")
+	var output bytes.Buffer
+	a := &Application{IO: IO{In: strings.NewReader(""), Out: &output, ErrOut: &output}, Build: buildinfo.Current()}
+	if err := a.Run(context.Background(), []string{"status", "--cwd", dir}); err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"kit · status", "저장소", "워크플로", "리뷰"} {
+		if !strings.Contains(output.String(), expected) {
+			t.Fatalf("status UI omitted %q:\n%s", expected, output.String())
+		}
+	}
+	output.Reset()
+	if err := a.Run(context.Background(), []string{"backup", "list", "--cwd", dir}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "kit · backup list") {
+		t.Fatalf("backup alias did not use canonical UI:\n%s", output.String())
 	}
 }
 
@@ -95,7 +155,7 @@ func TestPickReportsNonTTYBeforeMutation(t *testing.T) {
 			return nil, selector.ErrNotTTY
 		},
 	}
-	err := a.Run(context.Background(), []string{"pick", "feat/test", "--cwd", dir})
+	err := a.Run(context.Background(), []string{"pick", "feat/test", "--local", "--cwd", dir})
 	if clierror.Code(err) != clierror.Failure || !strings.Contains(err.Error(), "TTY") {
 		t.Fatalf("expected non-TTY error, got %v", err)
 	}
@@ -157,7 +217,7 @@ func TestPickCreatesBranchAndAppliesSourceOrder(t *testing.T) {
 			return items, nil
 		},
 	}
-	if err := a.Run(context.Background(), []string{"pick", "feat/test", "--cwd", dir, "--yes"}); err != nil {
+	if err := a.Run(context.Background(), []string{"pick", "feat/test", "--local", "--cwd", dir, "--yes"}); err != nil {
 		t.Fatal(err)
 	}
 	cmd := exec.Command("git", "log", "--reverse", "--format=%s", "develop..feat/test")
@@ -199,7 +259,7 @@ func TestPickRejectsDirtyTreeBeforeSelection(t *testing.T) {
 			return nil, nil
 		},
 	}
-	err := a.Run(context.Background(), []string{"pick", "feat/dirty", "--cwd", dir})
+	err := a.Run(context.Background(), []string{"pick", "feat/dirty", "--local", "--cwd", dir})
 	if clierror.Code(err) != clierror.Failure || !strings.Contains(err.Error(), "working tree has changes") {
 		t.Fatalf("expected dirty-tree error, got %v", err)
 	}
@@ -233,7 +293,7 @@ func TestPickConflictAbortRestoresCheckoutAndDeletesTarget(t *testing.T) {
 			return items, nil
 		},
 	}
-	err := a.Run(context.Background(), []string{"pick", "feat/conflict", "--cwd", dir, "--yes", "--allow-stale"})
+	err := a.Run(context.Background(), []string{"pick", "feat/conflict", "--local", "--cwd", dir, "--yes", "--allow-stale"})
 	if clierror.Code(err) != clierror.Failure || !strings.Contains(err.Error(), "restored the original checkout") {
 		t.Fatalf("expected clean abort result, got %v\n%s", err, output.String())
 	}
@@ -275,7 +335,7 @@ func TestPickCanResumeAfterProcessExit(t *testing.T) {
 			return items, nil
 		},
 	}
-	err := a.Run(context.Background(), []string{"pick", "feat/resume", "--cwd", dir, "--yes", "--allow-stale"})
+	err := a.Run(context.Background(), []string{"pick", "feat/resume", "--local", "--cwd", dir, "--yes", "--allow-stale"})
 	if clierror.Code(err) != clierror.Conflict || !strings.Contains(err.Error(), "resume") {
 		t.Fatalf("expected paused pick, got %v", err)
 	}
@@ -319,7 +379,7 @@ func TestPickContinueAcceptsConflictResolutionCommittedInIDE(t *testing.T) {
 			return items, nil
 		},
 	}
-	err := pause.Run(context.Background(), []string{"pick", "feat/ide", "--cwd", dir, "--yes", "--allow-stale"})
+	err := pause.Run(context.Background(), []string{"pick", "feat/ide", "--local", "--cwd", dir, "--yes", "--allow-stale"})
 	if clierror.Code(err) != clierror.Conflict {
 		t.Fatalf("expected paused conflict, got %v", err)
 	}
@@ -490,8 +550,8 @@ func TestPickRejectsStaleWorkBeforeSelection(t *testing.T) {
 			return nil, nil
 		},
 	}
-	err := a.Run(context.Background(), []string{"pick", "feat/stale", "--cwd", dir})
-	if clierror.Code(err) != clierror.Conflict || !strings.Contains(err.Error(), "kit git sync") {
+	err := a.Run(context.Background(), []string{"pick", "feat/stale", "--local", "--from", "work", "--cwd", dir})
+	if clierror.Code(err) != clierror.Conflict || !strings.Contains(err.Error(), "kit sync") {
 		t.Fatalf("expected stale work conflict, got %v", err)
 	}
 	if selected {
@@ -509,7 +569,7 @@ func TestConfigInitWritesRepositoryDefaults(t *testing.T) {
 	if got := gitCommandOutput(t, dir, "config", "--local", "--get", "kit.git.base"); got != "develop" {
 		t.Fatalf("unexpected configured base: %s", got)
 	}
-	if got := gitCommandOutput(t, dir, "config", "--local", "--get", "kit.git.provider"); got != "auto" {
+	if got := gitCommandOutput(t, dir, "config", "--local", "--get", "kit.git.provider"); got != "gitea" {
 		t.Fatalf("unexpected configured provider: %s", got)
 	}
 }

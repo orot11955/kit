@@ -9,13 +9,15 @@ import (
 )
 
 type Repository struct {
-	Provider string `json:"provider"`
-	Remote   string `json:"remote_url"`
-	WebURL   string `json:"web_url,omitempty"`
-	Host     string `json:"host,omitempty"`
-	Path     string `json:"path,omitempty"`
-	Owner    string `json:"owner,omitempty"`
-	Name     string `json:"name,omitempty"`
+	Provider          string `json:"provider"`
+	Remote            string `json:"remote_url"`
+	WebURL            string `json:"web_url,omitempty"`
+	Host              string `json:"host,omitempty"`
+	Path              string `json:"path,omitempty"`
+	Owner             string `json:"owner,omitempty"`
+	Name              string `json:"name,omitempty"`
+	Scheme            string `json:"scheme,omitempty"`
+	AllowInsecureHTTP bool   `json:"allow_insecure_http,omitempty"`
 }
 
 func Resolve(configuredProvider, remote string) Repository {
@@ -25,8 +27,10 @@ func Resolve(configuredProvider, remote string) Repository {
 		switch {
 		case strings.Contains(strings.ToLower(host), "gitlab"):
 			provider = "gitlab"
-		case strings.Contains(strings.ToLower(host), "forgejo"), strings.Contains(strings.ToLower(host), "gitea"):
+		case strings.Contains(strings.ToLower(host), "forgejo"):
 			provider = "forgejo"
+		case strings.Contains(strings.ToLower(host), "gitea"):
+			provider = "gitea"
 		default:
 			provider = "generic"
 		}
@@ -48,7 +52,28 @@ func Resolve(configuredProvider, remote string) Repository {
 		Path:     repositoryPath,
 		Owner:    owner,
 		Name:     name,
+		Scheme:   scheme,
 	}
+}
+
+// InsecureHTTPAllowed reports whether this repository is explicitly eligible
+// for token-authenticated HTTP review requests. DNS names are intentionally not
+// resolved: the remote must name a private literal address directly.
+func (r Repository) InsecureHTTPAllowed() bool {
+	return r.Provider == "gitea" && r.Scheme == "http" && r.AllowInsecureHTTP && IsPrivateLiteralHost(r.Host)
+}
+
+func IsPrivateLiteralHost(host string) bool {
+	parsed, err := url.Parse("http://" + host)
+	if err != nil || parsed.Host != host || parsed.Hostname() == "" {
+		return false
+	}
+	literal := parsed.Hostname()
+	if zone := strings.LastIndex(literal, "%"); zone > 0 && strings.Contains(literal[:zone], ":") {
+		literal = literal[:zone]
+	}
+	ip := net.ParseIP(literal)
+	return ip != nil && (ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast())
 }
 
 func sanitizeRemote(remote string) string {
@@ -79,6 +104,8 @@ func (r Repository) ReviewName() string {
 		return "Merge Request"
 	case "forgejo":
 		return "Pull Request"
+	case "gitea":
+		return "Pull Request"
 	default:
 		return "review"
 	}
@@ -94,7 +121,7 @@ func (r Repository) ReviewURL(source, target string) string {
 		query.Set("merge_request[source_branch]", source)
 		query.Set("merge_request[target_branch]", target)
 		return r.WebURL + "/-/merge_requests/new?" + query.Encode()
-	case "forgejo":
+	case "forgejo", "gitea":
 		return fmt.Sprintf("%s/compare/%s...%s", r.WebURL, url.PathEscape(target), url.PathEscape(source))
 	default:
 		return r.WebURL
@@ -120,7 +147,7 @@ func parseRemote(remote string) (host, repositoryPath, scheme string) {
 		if at := strings.LastIndex(left, "@"); at >= 0 {
 			left = left[at+1:]
 		}
-		return strings.ToLower(left), cleanPath(right), "https"
+		return strings.ToLower(left), cleanPath(right), "ssh"
 	}
 	return "", "", ""
 }

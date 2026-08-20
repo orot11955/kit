@@ -14,8 +14,10 @@ identity=${1:-legacy}
   echo "kit deploy SSH: wrapper accepts at most one identity" >&2
   exit 1
 }
+# forgejo is accepted only so an already-installed forced-command key keeps working
+# during the Gitea key rotation. New authorized_keys entries must use gitea.
 case "$identity" in
-  manual|forgejo|legacy) ;;
+  manual|gitea|forgejo|legacy) ;;
   *)
     echo "kit deploy SSH: invalid wrapper identity" >&2
     exit 1

@@ -20,6 +20,10 @@ func (r Renderer) Notice(title string) {
 	fmt.Fprintf(r.Writer, "%skit ! %s%s\n\n", r.code("\x1b[1;33m"), SafeText(title), r.reset())
 }
 
+func (r Renderer) Section(title string) {
+	fmt.Fprintf(r.Writer, "  %s%s%s\n", r.code("\x1b[1m"), SafeText(title), r.reset())
+}
+
 func (r Renderer) Success(label, value string) {
 	fmt.Fprintf(r.Writer, "  %s✓%s %-12s %s\n", r.code("\x1b[32m"), r.reset(), SafeText(label), SafeText(value))
 }
@@ -28,12 +32,16 @@ func (r Renderer) Warning(label, value string) {
 	fmt.Fprintf(r.Writer, "  %s!%s %-12s %s\n", r.code("\x1b[33m"), r.reset(), SafeText(label), SafeText(value))
 }
 
+func (r Renderer) Pending(label, value string) {
+	fmt.Fprintf(r.Writer, "  %s●%s %-12s %s\n", r.code("\x1b[36m"), r.reset(), SafeText(label), SafeText(value))
+}
+
 func (r Renderer) Field(label, value string) {
 	fmt.Fprintf(r.Writer, "    %-12s %s\n", SafeText(label), SafeText(value))
 }
 
 func (r Renderer) Next(command string) {
-	fmt.Fprintf(r.Writer, "\n다음\n  %s$ %s%s\n", r.code("\x1b[36m"), SafeText(command), r.reset())
+	fmt.Fprintf(r.Writer, "\n  %s다음%s\n    %s$ %s%s\n", r.code("\x1b[1m"), r.reset(), r.code("\x1b[36m"), SafeText(command), r.reset())
 }
 
 func ShellQuote(argument string) string {

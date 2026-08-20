@@ -103,7 +103,7 @@ func Refresh(ctx context.Context, service gitservice.Service, config gitservice.
 	if err != nil {
 		return result, fmt.Errorf("record current checkout: %w", err)
 	}
-	backup, _, err := rebuildSource(ctx, service, config.Base, config.Source, originalHash, originalBranch, pending, nil)
+	backup, _, err := rebuildSource(ctx, service, config.Base, config.Source, originalHash, originalBranch, "", pending, nil)
 	if err != nil {
 		return result, err
 	}
@@ -189,12 +189,20 @@ func Sync(ctx context.Context, service gitservice.Service, opts SyncOptions) (Sy
 	if err != nil {
 		return result, fmt.Errorf("record current checkout: %w", err)
 	}
-	if err := updateBase(ctx, service, config.Base, remoteBase, originalHash, originalBranch); err != nil {
+	if err := updateBase(ctx, service, config.Base, remoteBase, result.BaseBefore, originalHash, originalBranch); err != nil {
 		return result, err
+	}
+	rollbackUpdatedBase := func(cause error) error {
+		recoveryCtx, cancel := recoveryContext()
+		defer cancel()
+		if rollbackErr := restoreBaseAndCheckout(recoveryCtx, service, config.Base, result.BaseBefore, originalHash, originalBranch); rollbackErr != nil {
+			return fmt.Errorf("%v; base rollback failed: %w", cause, rollbackErr)
+		}
+		return fmt.Errorf("%v; base %s and original checkout were restored", cause, config.Base)
 	}
 	result.BaseAfter, err = service.RevisionHash(ctx, config.Base)
 	if err != nil {
-		return result, err
+		return result, rollbackUpdatedBase(err)
 	}
 	if opts.BaseOnly {
 		return result, nil
@@ -202,7 +210,7 @@ func Sync(ctx context.Context, service gitservice.Service, opts SyncOptions) (Sy
 
 	synced, err := service.IsAncestor(ctx, config.Base, config.Source)
 	if err != nil {
-		return result, err
+		return result, rollbackUpdatedBase(err)
 	}
 	if synced && result.AppliedDropped == 0 {
 		return result, nil
@@ -210,11 +218,11 @@ func Sync(ctx context.Context, service gitservice.Service, opts SyncOptions) (Sy
 
 	commits, err := service.Candidates(ctx, config.Base, config.Source, true)
 	if err != nil {
-		return result, fmt.Errorf("list source commits after base update: %w", err)
+		return result, rollbackUpdatedBase(fmt.Errorf("list source commits after base update: %w", err))
 	}
 	commits, err = service.Applied(ctx, config.Base, commits)
 	if err != nil {
-		return result, fmt.Errorf("classify source commits after base update: %w", err)
+		return result, rollbackUpdatedBase(fmt.Errorf("classify source commits after base update: %w", err))
 	}
 	commits = markTrustedApplied(commits, opts.TrustedAppliedHashes)
 	pending := make([]gitservice.Commit, 0, len(commits))
@@ -228,7 +236,7 @@ func Sync(ctx context.Context, service gitservice.Service, opts SyncOptions) (Sy
 			pending = append(pending, commit)
 		}
 	}
-	backup, skipped, err := rebuildSource(ctx, service, config.Base, config.Source, originalHash, originalBranch, pending, opts.Resolver)
+	backup, skipped, err := rebuildSource(ctx, service, config.Base, config.Source, originalHash, originalBranch, result.BaseBefore, pending, opts.Resolver)
 	if err != nil {
 		return result, err
 	}
@@ -251,32 +259,39 @@ func markTrustedApplied(commits []gitservice.Commit, trusted map[string]struct{}
 	return commits
 }
 
-func updateBase(ctx context.Context, service gitservice.Service, base, remoteBase, originalHash, originalBranch string) error {
+func updateBase(ctx context.Context, service gitservice.Service, base, remoteBase, baseBefore, originalHash, originalBranch string) error {
 	if originalBranch != base {
 		if err := service.Switch(ctx, base); err != nil {
 			recoveryCtx, cancel := recoveryContext()
 			defer cancel()
-			_ = restoreCheckout(recoveryCtx, service, originalHash, originalBranch)
-			return fmt.Errorf("switch to %s: %w", base, err)
+			if rollbackErr := restoreBaseAndCheckout(recoveryCtx, service, base, baseBefore, originalHash, originalBranch); rollbackErr != nil {
+				return fmt.Errorf("switch to %s: %w; base rollback failed: %v", base, err, rollbackErr)
+			}
+			return fmt.Errorf("switch to %s: %w; base and original checkout were restored", base, err)
 		}
 	}
 	if err := service.MergeFFOnly(ctx, remoteBase); err != nil {
 		recoveryCtx, cancel := recoveryContext()
 		defer cancel()
-		_ = restoreCheckout(recoveryCtx, service, originalHash, originalBranch)
-		return fmt.Errorf("fast-forward %s from %s: %w", base, remoteBase, err)
+		if rollbackErr := restoreBaseAndCheckout(recoveryCtx, service, base, baseBefore, originalHash, originalBranch); rollbackErr != nil {
+			return fmt.Errorf("fast-forward %s from %s: %w; base rollback failed: %v", base, remoteBase, err, rollbackErr)
+		}
+		return fmt.Errorf("fast-forward %s from %s: %w; base and original checkout were restored", base, remoteBase, err)
 	}
 	if originalBranch != base {
 		recoveryCtx, cancel := recoveryContext()
 		defer cancel()
 		if err := restoreCheckout(recoveryCtx, service, originalHash, originalBranch); err != nil {
-			return fmt.Errorf("restore checkout after updating %s: %w", base, err)
+			if rollbackErr := restoreBaseAndCheckout(recoveryCtx, service, base, baseBefore, originalHash, originalBranch); rollbackErr != nil {
+				return fmt.Errorf("restore checkout after updating %s: %w; base rollback failed: %v", base, err, rollbackErr)
+			}
+			return fmt.Errorf("restore checkout after updating %s: %w; base and original checkout were restored", base, err)
 		}
 	}
 	return nil
 }
 
-func rebuildSource(ctx context.Context, service gitservice.Service, base, source, originalHash, originalBranch string, pending []gitservice.Commit, resolver SyncConflictResolver) (string, int, error) {
+func rebuildSource(ctx context.Context, service gitservice.Service, base, source, originalHash, originalBranch, rollbackBaseHash string, pending []gitservice.Commit, resolver SyncConflictResolver) (string, int, error) {
 	sourceHash, err := service.RevisionHash(ctx, source)
 	if err != nil {
 		return "", 0, err
@@ -290,15 +305,16 @@ func rebuildSource(ctx context.Context, service gitservice.Service, base, source
 		short = short[:8]
 	}
 	timestamp := time.Now().UTC().Format("20060102-150405")
-	backup := fmt.Sprintf("kit/backup/%s-%s-%s", strings.ReplaceAll(source, "/", "-"), timestamp, short)
+	backup, err := gitservice.FormatWorkBackupRef(source, gitservice.WorkBackupAuto, timestamp+"-"+short)
+	if err != nil {
+		return "", 0, fmt.Errorf("format backup branch: %w", err)
+	}
 	temporary := fmt.Sprintf("kit/tmp/%s-%d-%s", strings.ReplaceAll(source, "/", "-"), os.Getpid(), strconv.FormatInt(time.Now().UnixNano(), 36))
 	if err := service.CreateBranchAt(ctx, backup, sourceHash); err != nil {
 		return "", 0, fmt.Errorf("create backup branch %s: %w", backup, err)
 	}
-	if err := service.CreateBranch(ctx, temporary, base); err != nil {
-		return backup, 0, fmt.Errorf("create temporary work branch: %w", err)
-	}
-	cleanup := func() (string, error) {
+	temporaryCreated := false
+	cleanup := func() (string, bool, error) {
 		recoveryCtx, cancel := recoveryContext()
 		defer cancel()
 
@@ -314,42 +330,104 @@ func rebuildSource(ctx context.Context, service gitservice.Service, base, source
 
 		recovery := ""
 		deleteTemporary := false
-		temporaryHead, err := service.RevisionHash(recoveryCtx, temporary)
-		if err != nil {
-			recovery = temporary
-			cleanupErrors = append(cleanupErrors, fmt.Sprintf("read temporary branch: %v", err))
-		} else if temporaryHead == baseHash {
-			deleteTemporary = true
-		} else {
-			recovery = strings.Replace(temporary, "kit/tmp/", "kit/recovery/", 1)
-			if err := service.CreateBranchAt(recoveryCtx, recovery, temporaryHead); err != nil {
+		if temporaryCreated {
+			temporaryHead, err := service.RevisionHash(recoveryCtx, temporary)
+			if err != nil {
 				recovery = temporary
-				cleanupErrors = append(cleanupErrors, fmt.Sprintf("create recovery branch: %v", err))
-			} else {
+				cleanupErrors = append(cleanupErrors, fmt.Sprintf("read temporary branch %s: %v", temporary, err))
+			} else if temporaryHead == baseHash {
 				deleteTemporary = true
+			} else {
+				recovery = strings.Replace(temporary, "kit/tmp/", "kit/recovery/", 1)
+				if err := service.CreateBranchAt(recoveryCtx, recovery, temporaryHead); err != nil {
+					recovery = temporary
+					cleanupErrors = append(cleanupErrors, fmt.Sprintf("create recovery branch %s: %v", recovery, err))
+				} else {
+					deleteTemporary = true
+				}
 			}
 		}
 
-		restored := true
+		// A failure can happen after source or base has already moved. Detach
+		// first when either ref is checked out so both refs can be restored.
+		_, currentBranch, headErr := service.Head(recoveryCtx)
+		if headErr != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Sprintf("read checkout before rollback: %v", headErr))
+		} else if currentBranch == source || (rollbackBaseHash != "" && currentBranch == base) {
+			detachHash := sourceHash
+			if currentBranch == base {
+				detachHash = rollbackBaseHash
+			}
+			if err := service.SwitchDetach(recoveryCtx, detachHash); err != nil {
+				cleanupErrors = append(cleanupErrors, fmt.Sprintf("detach %s before rollback: %v", currentBranch, err))
+			}
+		}
+		if err := service.ForceBranch(recoveryCtx, source, sourceHash); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Sprintf("restore source ref %s to %s: %v", source, sourceHash, err))
+		}
+		if rollbackBaseHash != "" {
+			if err := service.ForceBranch(recoveryCtx, base, rollbackBaseHash); err != nil {
+				cleanupErrors = append(cleanupErrors, fmt.Sprintf("restore base ref %s to %s: %v", base, rollbackBaseHash, err))
+			}
+		}
 		if err := restoreCheckout(recoveryCtx, service, originalHash, originalBranch); err != nil {
-			restored = false
 			cleanupErrors = append(cleanupErrors, fmt.Sprintf("restore original checkout: %v", err))
 		}
-		if restored && deleteTemporary {
+
+		if restoredSource, err := service.RevisionHash(recoveryCtx, source); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Sprintf("verify source ref %s: %v", source, err))
+		} else if restoredSource != sourceHash {
+			cleanupErrors = append(cleanupErrors, fmt.Sprintf("verify source ref %s: got %s, want %s", source, restoredSource, sourceHash))
+		}
+		if rollbackBaseHash != "" {
+			if restoredBase, err := service.RevisionHash(recoveryCtx, base); err != nil {
+				cleanupErrors = append(cleanupErrors, fmt.Sprintf("verify base ref %s: %v", base, err))
+			} else if restoredBase != rollbackBaseHash {
+				cleanupErrors = append(cleanupErrors, fmt.Sprintf("verify base ref %s: got %s, want %s", base, restoredBase, rollbackBaseHash))
+			}
+		}
+		if restoredHash, restoredBranch, err := service.Head(recoveryCtx); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Sprintf("verify original checkout: %v", err))
+		} else if restoredHash != originalHash || restoredBranch != originalBranch {
+			cleanupErrors = append(cleanupErrors, fmt.Sprintf("verify original checkout: got branch %q at %s, want branch %q at %s", restoredBranch, restoredHash, originalBranch, originalHash))
+		}
+
+		if len(cleanupErrors) == 0 && deleteTemporary {
 			if err := service.DeleteBranch(recoveryCtx, temporary, true); err != nil {
-				cleanupErrors = append(cleanupErrors, fmt.Sprintf("remove temporary branch: %v", err))
+				cleanupErrors = append(cleanupErrors, fmt.Sprintf("remove temporary branch %s: %v", temporary, err))
+			}
+		}
+
+		backupRemoved := false
+		if len(cleanupErrors) == 0 {
+			if err := service.DeleteBranch(recoveryCtx, backup, true); err != nil {
+				cleanupErrors = append(cleanupErrors, fmt.Sprintf("remove rollback backup %s: %v", backup, err))
+			} else if exists, err := service.LocalBranchExists(recoveryCtx, backup); err != nil {
+				cleanupErrors = append(cleanupErrors, fmt.Sprintf("verify rollback backup removal %s: %v", backup, err))
+			} else if exists {
+				cleanupErrors = append(cleanupErrors, fmt.Sprintf("verify rollback backup removal %s: branch still exists", backup))
+			} else {
+				backupRemoved = true
 			}
 		}
 		if len(cleanupErrors) > 0 {
-			return recovery, fmt.Errorf("%s", strings.Join(cleanupErrors, "; "))
+			return recovery, backupRemoved, fmt.Errorf("%s", strings.Join(cleanupErrors, "; "))
 		}
-		return recovery, nil
+		return recovery, backupRemoved, nil
 	}
 	fail := func(commit *gitservice.Commit, cause error) error {
-		recovery, cleanupErr := cleanup()
-		message := fmt.Sprintf("rebuild was aborted; original %s was kept and backup is %s", source, backup)
+		recovery, backupRemoved, cleanupErr := cleanup()
+		message := fmt.Sprintf("rebuild was aborted; original work was kept; source %s was restored", source)
 		if commit != nil {
-			message = fmt.Sprintf("reapply %s (%s) was aborted; original %s was kept and backup is %s", commit.ShortHash, commit.Subject, source, backup)
+			message = fmt.Sprintf("reapply %s (%s) was aborted; original work was kept; source %s was restored", commit.ShortHash, commit.Subject, source)
+		}
+		if rollbackBaseHash != "" {
+			message += "; base " + base + " was restored"
+		}
+		if backupRemoved {
+			message += "; rollback backup " + backup + " was removed after verification"
+		} else {
+			message += "; rollback backup remains at " + backup
 		}
 		if recovery != "" {
 			message += "; partial rebuilt commits are preserved in " + recovery
@@ -362,6 +440,10 @@ func rebuildSource(ctx context.Context, service gitservice.Service, base, source
 		}
 		return fmt.Errorf("%s", message)
 	}
+	if err := service.CreateBranch(ctx, temporary, base); err != nil {
+		return backup, 0, fail(nil, fmt.Errorf("create temporary work branch: %w", err))
+	}
+	temporaryCreated = true
 	skipped := 0
 	for _, commit := range pending {
 		headBefore, err := service.RevisionHash(ctx, "HEAD")
@@ -389,32 +471,25 @@ func rebuildSource(ctx context.Context, service gitservice.Service, base, source
 		return backup, skipped, fail(nil, fmt.Errorf("read rebuilt history: %w", err))
 	}
 	if err := service.ForceBranch(ctx, source, newHead); err != nil {
-		recoveryCtx, cancel := recoveryContext()
-		_ = service.ForceBranch(recoveryCtx, source, sourceHash)
-		cancel()
 		return backup, skipped, fail(nil, fmt.Errorf("move %s to rebuilt history: %w", source, err))
 	}
 	if originalBranch == source {
 		recoveryCtx, cancel := recoveryContext()
 		defer cancel()
 		if err := service.Switch(recoveryCtx, source); err != nil {
-			_ = service.ForceBranch(recoveryCtx, source, sourceHash)
-			cancel()
 			return backup, skipped, fail(nil, fmt.Errorf("switch to rebuilt %s: %w", source, err))
 		}
 	} else {
 		recoveryCtx, cancel := recoveryContext()
 		defer cancel()
 		if err := restoreCheckout(recoveryCtx, service, originalHash, originalBranch); err != nil {
-			_ = service.ForceBranch(recoveryCtx, source, sourceHash)
-			cancel()
 			return backup, skipped, fail(nil, fmt.Errorf("restore original checkout: %w", err))
 		}
 	}
 	recoveryCtx, cancel := recoveryContext()
 	defer cancel()
 	if err := service.DeleteBranch(recoveryCtx, temporary, true); err != nil {
-		return backup, skipped, fmt.Errorf("remove temporary branch %s: %w", temporary, err)
+		return backup, skipped, fail(nil, fmt.Errorf("remove temporary branch %s: %w", temporary, err))
 	}
 	return backup, skipped, nil
 }
@@ -501,4 +576,36 @@ func restoreCheckout(ctx context.Context, service gitservice.Service, hash, bran
 		return service.Switch(ctx, branch)
 	}
 	return service.SwitchDetach(ctx, hash)
+}
+
+func restoreBaseAndCheckout(ctx context.Context, service gitservice.Service, base, baseHash, originalHash, originalBranch string) error {
+	var rollbackErrors []string
+	_, currentBranch, err := service.Head(ctx)
+	if err != nil {
+		rollbackErrors = append(rollbackErrors, fmt.Sprintf("read checkout: %v", err))
+	} else if currentBranch == base {
+		if err := service.SwitchDetach(ctx, baseHash); err != nil {
+			rollbackErrors = append(rollbackErrors, fmt.Sprintf("detach %s: %v", base, err))
+		}
+	}
+	if err := service.ForceBranch(ctx, base, baseHash); err != nil {
+		rollbackErrors = append(rollbackErrors, fmt.Sprintf("restore base ref %s: %v", base, err))
+	}
+	if err := restoreCheckout(ctx, service, originalHash, originalBranch); err != nil {
+		rollbackErrors = append(rollbackErrors, fmt.Sprintf("restore original checkout: %v", err))
+	}
+	if restoredBase, err := service.RevisionHash(ctx, base); err != nil {
+		rollbackErrors = append(rollbackErrors, fmt.Sprintf("verify base ref %s: %v", base, err))
+	} else if restoredBase != baseHash {
+		rollbackErrors = append(rollbackErrors, fmt.Sprintf("verify base ref %s: got %s, want %s", base, restoredBase, baseHash))
+	}
+	if restoredHash, restoredBranch, err := service.Head(ctx); err != nil {
+		rollbackErrors = append(rollbackErrors, fmt.Sprintf("verify original checkout: %v", err))
+	} else if restoredHash != originalHash || restoredBranch != originalBranch {
+		rollbackErrors = append(rollbackErrors, fmt.Sprintf("verify original checkout: got branch %q at %s, want branch %q at %s", restoredBranch, restoredHash, originalBranch, originalHash))
+	}
+	if len(rollbackErrors) > 0 {
+		return fmt.Errorf("%s", strings.Join(rollbackErrors, "; "))
+	}
+	return nil
 }

@@ -4,20 +4,22 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 )
 
 type WorkflowConfig struct {
-	Provider string `json:"provider"`
-	Remote   string `json:"remote"`
-	Stable   string `json:"stable"`
-	Base     string `json:"base"`
-	Source   string `json:"source"`
+	Provider          string `json:"provider"`
+	Remote            string `json:"remote"`
+	Stable            string `json:"stable"`
+	Base              string `json:"base"`
+	Source            string `json:"source"`
+	AllowInsecureHTTP bool   `json:"allow_insecure_http"`
 }
 
 func DefaultWorkflowConfig() WorkflowConfig {
 	return WorkflowConfig{
-		Provider: "auto",
+		Provider: "gitea",
 		Remote:   "origin",
 		Stable:   "main",
 		Base:     "develop",
@@ -26,11 +28,12 @@ func DefaultWorkflowConfig() WorkflowConfig {
 }
 
 var workflowConfigKeys = map[string]string{
-	"git.provider": "kit.git.provider",
-	"git.remote":   "kit.git.remote",
-	"git.stable":   "kit.git.stable",
-	"git.base":     "kit.git.base",
-	"git.source":   "kit.git.source",
+	"git.provider":            "kit.git.provider",
+	"git.remote":              "kit.git.remote",
+	"git.stable":              "kit.git.stable",
+	"git.base":                "kit.git.base",
+	"git.source":              "kit.git.source",
+	"git.allow-insecure-http": "kit.git.allow-insecure-http",
 }
 
 func WorkflowConfigNames() []string {
@@ -63,6 +66,9 @@ func (s Service) WorkflowConfig(ctx context.Context) WorkflowConfig {
 			*target = value
 		}
 	}
+	if value, err := s.ConfigGet(ctx, "git.allow-insecure-http"); err == nil {
+		config.AllowInsecureHTTP = value == "true"
+	}
 	return config
 }
 
@@ -87,8 +93,23 @@ func (s Service) ConfigSet(ctx context.Context, name, value string) error {
 	if value == "" {
 		return fmt.Errorf("repository config %q must not be empty", name)
 	}
-	if name == "git.provider" && value != "auto" && value != "gitlab" && value != "forgejo" && value != "generic" {
-		return fmt.Errorf("git.provider must be auto, gitlab, forgejo, or generic")
+	if name == "git.provider" {
+		switch value {
+		case "auto", "gitea", "generic":
+		case "gitlab", "forgejo":
+			// Legacy values remain readable and may be written back unchanged by
+			// config init so an in-flight review can be completed during cutover.
+			// New repository configuration must use the canonical Gitea provider.
+			current, currentErr := s.ConfigGet(ctx, name)
+			if currentErr != nil || current != value {
+				return fmt.Errorf("git.provider %s is legacy and cannot be newly configured; use gitea", value)
+			}
+		default:
+			return fmt.Errorf("git.provider must be auto, gitea, or generic")
+		}
+	}
+	if name == "git.allow-insecure-http" && value != "true" && value != "false" {
+		return fmt.Errorf("git.allow-insecure-http must be true or false")
 	}
 	if name == "git.remote" {
 		if err := validateRemoteName(value); err != nil {
@@ -116,11 +137,12 @@ func (s Service) ConfigUnset(ctx context.Context, name string) error {
 func (s Service) InitializeWorkflowConfig(ctx context.Context) (WorkflowConfig, error) {
 	config := s.WorkflowConfig(ctx)
 	values := map[string]string{
-		"git.provider": config.Provider,
-		"git.remote":   config.Remote,
-		"git.stable":   config.Stable,
-		"git.base":     config.Base,
-		"git.source":   config.Source,
+		"git.provider":            config.Provider,
+		"git.remote":              config.Remote,
+		"git.stable":              config.Stable,
+		"git.base":                config.Base,
+		"git.source":              config.Source,
+		"git.allow-insecure-http": strconv.FormatBool(config.AllowInsecureHTTP),
 	}
 	for _, name := range WorkflowConfigNames() {
 		if err := s.ConfigSet(ctx, name, values[name]); err != nil {

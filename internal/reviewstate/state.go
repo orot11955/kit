@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"kit/internal/hosting"
 	"kit/internal/review"
 )
 
@@ -254,12 +255,24 @@ func validate(state State) error {
 	}
 	if state.ReviewURL != "" {
 		parsed, err := url.Parse(state.ReviewURL)
-		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil {
-			return errors.New("review URL must be an HTTPS URL without credentials")
+		if err != nil || parsed.Host == "" || parsed.User != nil {
+			return errors.New("review URL must be an allowed URL without credentials")
+		}
+		switch parsed.Scheme {
+		case "https":
+		case "http":
+			if state.Provider != "gitea" || !hosting.IsPrivateLiteralHost(parsed.Host) {
+				return errors.New("HTTP review URL requires Gitea on a literal private, loopback, or link-local IP address")
+			}
+		default:
+			return errors.New("review URL must use HTTPS or explicitly allowed private Gitea HTTP")
 		}
 	}
 	if stageAtLeastPublished(state.Stage) {
-		if state.Provider != "gitlab" && state.Provider != "forgejo" {
+		// Schema 1 states written by older kit releases may still use the
+		// legacy GitLab or Forgejo providers. Keep them readable while Gitea is
+		// the canonical provider for newly submitted reviews.
+		if state.Provider != "gitea" && state.Provider != "gitlab" && state.Provider != "forgejo" {
 			return errors.New("published review state requires a supported provider")
 		}
 		if state.Remote == "" || state.PublishedTip == "" {

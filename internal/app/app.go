@@ -11,9 +11,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/term"
 
+	"kit/internal/auth"
 	"kit/internal/buildinfo"
 	"kit/internal/clierror"
 	gitservice "kit/internal/git"
@@ -35,27 +37,34 @@ type IO struct {
 }
 
 type Application struct {
-	IO           IO
-	Git          func(dir string) gitservice.Service
-	Select       func([]selector.Item, string) ([]selector.Item, error)
-	Update       func(context.Context, update.Config) (update.Result, error)
-	ReviewClient func(hosting.Repository) (review.Client, error)
-	Build        buildinfo.Info
-	ExecPath     string
+	IO                         IO
+	Git                        func(dir string) gitservice.Service
+	Select                     func([]selector.Item, string) ([]selector.Item, error)
+	Update                     func(context.Context, update.Config) (update.Result, error)
+	ReviewClient               func(hosting.Repository) (review.Client, error)
+	Auth                       AuthService
+	AuthInit                   func() (AuthService, error)
+	ReadSecret                 func(prompt string) (string, error)
+	Build                      buildinfo.Info
+	ExecPath                   string
+	statusReviewRefreshTimeout time.Duration
 }
 
 func New(input *os.File, output, errOutput *os.File) *Application {
 	terminal := selector.Terminal{In: input, Out: output}
-	return &Application{
+	application := &Application{
 		IO: IO{In: input, Out: output, ErrOut: errOutput, InFile: input, OutFile: output},
 		Git: func(dir string) gitservice.Service {
 			return gitservice.Service{Dir: dir}
 		},
-		Select:       terminal.Select,
-		Update:       update.Run,
-		ReviewClient: review.NewClient,
-		Build:        buildinfo.Current(),
+		Select:   terminal.Select,
+		Update:   update.Run,
+		AuthInit: func() (AuthService, error) { return auth.NewDefault() },
+		Build:    buildinfo.Current(),
 	}
+	application.ReadSecret = terminalSecretReader(input, errOutput)
+	application.ReviewClient = application.newReviewClient
+	return application
 }
 
 type globalOptions struct {
@@ -81,8 +90,14 @@ func (a *Application) Run(ctx context.Context, args []string) error {
 	if a.Update == nil {
 		a.Update = update.Run
 	}
+	if a.AuthInit == nil {
+		a.AuthInit = func() (AuthService, error) { return auth.NewDefault() }
+	}
+	if a.ReadSecret == nil {
+		a.ReadSecret = terminalSecretReader(a.IO.InFile, a.IO.ErrOut)
+	}
 	if a.ReviewClient == nil {
-		a.ReviewClient = review.NewClient
+		a.ReviewClient = a.newReviewClient
 	}
 	if a.Build.Version == "" {
 		a.Build = buildinfo.Current()
@@ -96,12 +111,22 @@ func (a *Application) Run(ctx context.Context, args []string) error {
 	case "", "help":
 		printRootHelp(a.IO.Out)
 		return nil
+	case "status":
+		return a.statusCommand(ctx, global, rest)
+	case "sync":
+		return a.syncCommand(ctx, global, rest)
+	case "review":
+		return a.gitReview(ctx, global, rest)
+	case "backup":
+		return a.backupCommand(ctx, global, rest)
 	case "git":
 		return a.gitCommand(ctx, global, rest)
 	case "self":
 		return a.selfCommand(ctx, global, rest)
 	case "config":
 		return a.configCommand(ctx, global, rest)
+	case "auth":
+		return a.authCommand(ctx, global, rest)
 	case "compare":
 		return a.compare(ctx, global, rest)
 	case "pick":
@@ -343,7 +368,10 @@ func (a *Application) printCompare(result compareResult, color bool) {
 	if color {
 		bold, green, yellow, cyan, gray, reset = "\x1b[1m", "\x1b[32m", "\x1b[33m", "\x1b[36m", "\x1b[90m", "\x1b[0m"
 	}
-	fmt.Fprintf(a.IO.Out, "\n%s%s → %s 비교%s\n\n", bold, result.Source, result.Base, reset)
+	renderer := ui.Renderer{Writer: a.IO.Out, Color: color}
+	renderer.Command("compare")
+	renderer.Field("Flow", fmt.Sprintf("%s → %s", result.Source, result.Base))
+	fmt.Fprintln(a.IO.Out)
 	fmt.Fprintf(a.IO.Out, "%s%-4s %-10s %-16s %s%s\n", bold, "STAT", "HASH", "DATE", "MESSAGE", reset)
 	for _, commit := range result.Commits {
 		status, statusColor := "●", yellow
@@ -352,7 +380,13 @@ func (a *Application) printCompare(result compareResult, color bool) {
 		}
 		fmt.Fprintf(a.IO.Out, "%s%s%s    %s%-10s%s %s%-16s%s %s\n", statusColor, status, reset, cyan, commit.ShortHash, reset, gray, commit.Date, reset, ui.SafeText(commit.Subject))
 	}
-	fmt.Fprintf(a.IO.Out, "\n%s✓ %d 반영%s  %s● %d 미반영%s  %s│ %s → %s%s\n\n", green, result.Applied, reset, yellow, result.Pending, reset, gray, result.Source, result.Base, reset)
+	fmt.Fprintln(a.IO.Out)
+	renderer.Success("Applied", fmt.Sprintf("%d개", result.Applied))
+	if result.Pending > 0 {
+		renderer.Pending("Pending", fmt.Sprintf("%d개", result.Pending))
+	} else {
+		renderer.Success("Pending", "없음")
+	}
 }
 
 type pickOptions struct {
@@ -365,6 +399,7 @@ type pickOptions struct {
 	fetch      bool
 	allowStale bool
 	submit     bool
+	localOnly  bool
 	wait       bool
 	action     string
 }
@@ -404,6 +439,8 @@ func parsePick(global globalOptions, args []string) (pickOptions, bool, error) {
 			opts.allowStale, args = true, args[1:]
 		case arg == "--submit":
 			opts.submit, args = true, args[1:]
+		case arg == "--local":
+			opts.localOnly, args = true, args[1:]
 		case arg == "--wait":
 			opts.submit, opts.wait, args = true, true, args[1:]
 		case arg == "--continue" || arg == "--skip" || arg == "--abort":
@@ -420,14 +457,20 @@ func parsePick(global globalOptions, args []string) (pickOptions, bool, error) {
 	if opts.action != "" && len(positionals) != 0 {
 		return opts, false, clierror.New(clierror.Usage, "pick resume actions do not accept a new branch name")
 	}
-	if opts.action != "" && (opts.submit || opts.wait) {
+	if opts.action != "" && (opts.submit || opts.localOnly || opts.wait) {
 		return opts, false, clierror.New(clierror.Usage, "pick resume actions use the submit settings saved by the original pick")
+	}
+	if opts.localOnly && (opts.submit || opts.wait) {
+		return opts, false, clierror.New(clierror.Usage, "--local cannot be combined with --submit or --wait")
 	}
 	if opts.action == "" && len(positionals) != 1 {
 		return opts, false, clierror.New(clierror.Usage, "pick requires exactly one new branch name")
 	}
 	if len(positionals) == 1 {
 		opts.target = positionals[0]
+	}
+	if opts.action == "" && !opts.localOnly {
+		opts.submit = true
 	}
 	if opts.source == "" || opts.base == "" {
 		return opts, false, clierror.New(clierror.Usage, "source and base branch must not be empty")
@@ -461,20 +504,8 @@ func (a *Application) pick(ctx context.Context, global globalOptions, args []str
 	if !opts.sourceSet {
 		opts.source = config.Source
 	}
-	if opts.fetch {
-		if err := service.Fetch(ctx, config.Remote); err != nil {
-			return clierror.Wrap(clierror.Failure, err, "fetch %s", config.Remote)
-		}
-	}
-	if err := verifyRevisions(ctx, service, opts.base, opts.source); err != nil {
-		return err
-	}
-	synced, err := service.IsAncestor(ctx, opts.base, opts.source)
-	if err != nil {
-		return clierror.Wrap(clierror.Failure, err, "check whether %s contains %s", opts.source, opts.base)
-	}
-	if !synced && !opts.allowStale {
-		return clierror.New(clierror.Conflict, "%s does not contain the current %s; run 'kit git sync' before pick (use --allow-stale only for recovery)", opts.source, opts.base)
+	if opts.submit && ((opts.sourceSet && opts.source != config.Source) || (opts.baseSet && opts.base != config.Base)) {
+		return clierror.New(clierror.Usage, "custom --from or --base can only create a local branch; add --local or update the repository config first")
 	}
 	if err := service.ValidateBranchName(ctx, opts.target); err != nil {
 		return clierror.Wrap(clierror.Failure, err, "invalid target branch name %q", opts.target)
@@ -486,19 +517,75 @@ func (a *Application) pick(ctx context.Context, global globalOptions, args []str
 	if exists {
 		return clierror.New(clierror.Failure, "target branch %q already exists", opts.target)
 	}
-	remoteExists, err := service.RemoteTrackingBranchExists(ctx, config.Remote, opts.target)
-	if err != nil {
-		return clierror.Wrap(clierror.Failure, err, "check remote-tracking branch %s/%s", config.Remote, opts.target)
-	}
-	if remoteExists {
-		return clierror.New(clierror.Failure, "target branch %q already exists on %s; fetch/prune or choose another name", opts.target, config.Remote)
-	}
 	clean, err := service.IsClean(ctx)
 	if err != nil {
 		return clierror.Wrap(clierror.Failure, err, "check working tree")
 	}
 	if !clean {
 		return clierror.New(clierror.Failure, "working tree has changes; commit or stash them before running kit pick")
+	}
+	if opts.submit {
+		ctx = withInsecureHTTPWarningOnce(ctx)
+		repository, err := reviewRepository(ctx, service, config)
+		if err != nil {
+			return err
+		}
+		warnInsecureHTTP(ctx, a.IO.ErrOut, repository)
+		if _, err := a.ReviewClient(repository); err != nil {
+			return clierror.Wrap(clierror.Failure, err, "initialize review provider before pick")
+		}
+	}
+	if opts.fetch || opts.submit {
+		if err := service.Fetch(ctx, config.Remote); err != nil {
+			return clierror.Wrap(clierror.Failure, err, "fetch %s", config.Remote)
+		}
+	}
+	if err := verifyRevisions(ctx, service, opts.base, opts.source); err != nil {
+		return err
+	}
+	synced, err := service.IsAncestor(ctx, opts.base, opts.source)
+	if err != nil {
+		return clierror.Wrap(clierror.Failure, err, "check whether %s contains %s", opts.source, opts.base)
+	}
+	needsSync := !synced
+	remoteBase := config.Remote + "/" + opts.base
+	if err := service.VerifyRevision(ctx, remoteBase); err == nil {
+		ahead, behind, compareErr := service.AheadBehind(ctx, opts.base, remoteBase)
+		if compareErr != nil {
+			return clierror.Wrap(clierror.Failure, compareErr, "compare %s with %s", opts.base, remoteBase)
+		}
+		needsSync = needsSync || ahead > 0 || behind > 0
+	}
+	if needsSync && !opts.allowStale {
+		if opts.sourceSet || opts.baseSet {
+			return clierror.New(clierror.Conflict, "%s, %s, and %s are not synchronized; run 'kit sync' before pick (use --allow-stale only for recovery)", opts.source, opts.base, remoteBase)
+		}
+		if err := a.syncCommand(ctx, opts.globalOptions, nil); err != nil {
+			return clierror.Wrap(clierror.Code(err), err, "automatic sync before pick failed")
+		}
+		synced, err = service.IsAncestor(ctx, opts.base, opts.source)
+		if err != nil {
+			return clierror.Wrap(clierror.Failure, err, "verify automatic sync before pick")
+		}
+		if !synced {
+			return clierror.New(clierror.Conflict, "%s still does not contain %s after sync", opts.source, opts.base)
+		}
+		if err := service.VerifyRevision(ctx, remoteBase); err == nil {
+			ahead, behind, compareErr := service.AheadBehind(ctx, opts.base, remoteBase)
+			if compareErr != nil {
+				return clierror.Wrap(clierror.Failure, compareErr, "verify base after automatic sync")
+			}
+			if ahead != 0 || behind != 0 {
+				return clierror.New(clierror.Conflict, "%s still differs from %s after sync", opts.base, remoteBase)
+			}
+		}
+	}
+	remoteExists, err := service.RemoteTrackingBranchExists(ctx, config.Remote, opts.target)
+	if err != nil {
+		return clierror.Wrap(clierror.Failure, err, "check remote-tracking branch %s/%s", config.Remote, opts.target)
+	}
+	if remoteExists {
+		return clierror.New(clierror.Failure, "target branch %q already exists on %s; fetch/prune or choose another name", opts.target, config.Remote)
 	}
 	commits, err := service.Candidates(ctx, opts.base, opts.source, true)
 	if err != nil {
@@ -515,7 +602,9 @@ func (a *Application) pick(ctx context.Context, global globalOptions, args []str
 		}
 	}
 	if len(pending) == 0 {
-		fmt.Fprintln(a.IO.Out, "미반영 커밋이 없습니다.")
+		renderer := a.renderer(opts.globalOptions)
+		renderer.Command("pick")
+		renderer.Success("Work", "미반영 커밋이 없습니다.")
 		return nil
 	}
 	items := make([]selector.Item, 0, len(pending))
@@ -553,7 +642,11 @@ func (a *Application) pick(ctx context.Context, global globalOptions, args []str
 	a.printPickSummary(opts, selected)
 	reader := bufio.NewReader(a.IO.In)
 	if !opts.yes {
-		fmt.Fprint(a.IO.Out, "계속하시겠습니까? [y/N] ")
+		prompt := "선택한 커밋으로 로컬 브랜치를 만드시겠습니까? [y/N] "
+		if opts.submit {
+			prompt = "선택한 커밋으로 브랜치를 만들고 push와 Gitea PR을 생성하시겠습니까? [y/N] "
+		}
+		fmt.Fprint(a.IO.Out, prompt)
 		answer, readErr := reader.ReadString('\n')
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
 			return clierror.Wrap(clierror.Failure, readErr, "read confirmation")
@@ -604,13 +697,27 @@ func (a *Application) runPick(ctx context.Context, global globalOptions, service
 			if err := pickstate.Remove(ctx, service); err != nil {
 				return clierror.Wrap(clierror.Failure, err, "remove completed pick state")
 			}
+			if state.SubmitAfterPick {
+				pushAttempted := false
+				err := a.reviewSubmit(ctx, global, reviewSubmitOptions{
+					wait: state.WaitAfterSubmit, removeSourceBranch: true, confirmed: true,
+					pushAttempted: &pushAttempted,
+				}, &service)
+				if err == nil {
+					return nil
+				}
+				if pushAttempted {
+					return clierror.Wrap(clierror.Code(err), err, "review submit did not finish after push started; %s and its review state were kept for retry", state.TargetBranch)
+				}
+				if rollbackErr := rollbackPickBeforePush(service, state); rollbackErr != nil {
+					return clierror.Wrap(clierror.Code(err), err, "review submit failed before push; automatic rollback was incomplete: %v", rollbackErr)
+				}
+				return clierror.Wrap(clierror.Code(err), err, "review submit failed before push; restored %s and removed %s", state.OriginalBranch, state.TargetBranch)
+			}
 			renderer := a.renderer(global)
 			renderer.Command("pick")
 			renderer.Success("Branch", fmt.Sprintf("%s · %d개 커밋", state.TargetBranch, len(state.Commits)))
-			if state.SubmitAfterPick {
-				return a.reviewSubmit(ctx, global, reviewSubmitOptions{wait: state.WaitAfterSubmit, removeSourceBranch: true, confirmed: true}, &service)
-			}
-			renderer.Next("kit git review submit")
+			renderer.Next("kit review submit")
 			return nil
 		}
 		commit, err := service.Commit(ctx, state.Commits[state.Next])
@@ -660,6 +767,32 @@ func (a *Application) runPick(ctx context.Context, global globalOptions, service
 			fmt.Fprintln(a.IO.Out, "c, s, a, q 중 하나를 선택하세요.")
 		}
 	}
+}
+
+func rollbackPickBeforePush(service gitservice.Service, state pickstate.State) error {
+	rollbackCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := service.RestoreAndDeleteBranch(rollbackCtx, state.OriginalHash, state.OriginalBranch, state.TargetBranch); err != nil {
+		return err
+	}
+	headHash, headBranch, err := service.Head(rollbackCtx)
+	if err != nil {
+		return fmt.Errorf("verify original checkout: %w", err)
+	}
+	if headHash != state.OriginalHash || headBranch != state.OriginalBranch {
+		return fmt.Errorf("verify original checkout: got branch %q at %s, want branch %q at %s", headBranch, headHash, state.OriginalBranch, state.OriginalHash)
+	}
+	exists, err := service.LocalBranchExists(rollbackCtx, state.TargetBranch)
+	if err != nil {
+		return fmt.Errorf("verify target branch removal: %w", err)
+	}
+	if exists {
+		return fmt.Errorf("verify target branch removal: %s still exists", state.TargetBranch)
+	}
+	if err := reviewstate.Delete(rollbackCtx, service, state.TargetBranch); err != nil {
+		return fmt.Errorf("target branch %s was removed, but picked review state cleanup failed: %w", state.TargetBranch, err)
+	}
+	return nil
 }
 
 func (a *Application) resumePick(ctx context.Context, global globalOptions, service gitservice.Service, action string) error {
@@ -751,9 +884,20 @@ func (a *Application) abortPick(ctx context.Context, service gitservice.Service,
 }
 
 func (a *Application) printPickSummary(opts pickOptions, selected []gitservice.Commit) {
-	fmt.Fprintf(a.IO.Out, "\n새 브랜치: %s\n기준: %s\n원본: %s\n선택: %d commits\n\n", opts.target, opts.base, opts.source, len(selected))
+	renderer := a.renderer(opts.globalOptions)
+	renderer.Command("pick plan")
+	renderer.Section("브랜치")
+	renderer.Field("New", opts.target)
+	renderer.Field("Base", opts.base)
+	renderer.Field("Work", opts.source)
+	if opts.submit {
+		renderer.Field("Action", "브랜치 생성 · push · Gitea PR 생성")
+	} else {
+		renderer.Field("Action", "로컬 브랜치 생성")
+	}
+	renderer.Section(fmt.Sprintf("선택한 커밋 · %d개", len(selected)))
 	for _, commit := range selected {
-		fmt.Fprintf(a.IO.Out, "  ● %s %s\n", commit.ShortHash, ui.SafeText(commit.Subject))
+		renderer.Pending(commit.ShortHash, commit.Subject)
 	}
 	fmt.Fprintln(a.IO.Out)
 }
@@ -836,14 +980,23 @@ Usage:
   kit [global options] <command> [arguments]
 
 Commands:
-  git       Git workflow commands (status, compare, pick, sync, publish, review)
-  self      Kit version, update, and dependency checks
-  config    Repository-local kit workflow settings
-  compare   Shortcut for 'kit git compare'
-  pick      Shortcut for 'kit git pick'
-  version   Shortcut for 'kit self version'
-  update    Shortcut for 'kit self update'
-  doctor    Shortcut for 'kit self doctor'
+  status    Show the work queue, base synchronization, and tracked reviews
+  pick      Select work commits, push a branch, and create a Gitea PR
+  sync      Finish a merged review or synchronize develop and work
+  review    Advanced review inspection and recovery commands
+  backup    List, create, restore, and clean work backups
+
+Setup and maintenance:
+  auth      Gitea credential storage commands
+  config    Repository-local workflow settings
+  doctor    Check dependencies and repository configuration
+  update    Update the installed kit binary
+  version   Print build information
+
+Advanced compatibility:
+  compare   Show commit-level work/base comparison
+  git       Legacy namespace; existing 'kit git ...' commands remain supported
+  self      Legacy namespace for version, update, and doctor
 
 Global options:
   --cwd <path>   Run Git commands in another directory
@@ -870,12 +1023,13 @@ func printPickHelp(w io.Writer) {
 	fmt.Fprint(w, `Usage: kit pick <new-branch> [options]
 
 Options:
-  --from <branch>  Source branch (default: work)
-  --base <branch>  Base branch (default: develop)
+  --from <branch>  Source branch; custom values require --local (default: work)
+  --base <branch>  Base branch; custom values require --local (default: develop)
   --fetch          Fetch the configured remote before selection
   --allow-stale    Allow an outdated source branch (recovery only)
-  --submit         Push and create or reuse an MR/PR after picking
-  --wait           Submit, then wait for the MR/PR result
+  --local          Create the local branch without push or PR creation
+  --wait           Create the PR, then wait for its result
+  --submit         Compatibility option; submission is now the default
   --continue       Continue a paused kit pick after staging resolutions
   --skip           Skip the current commit in a paused kit pick
   --abort          Abort a paused kit pick and restore the original checkout

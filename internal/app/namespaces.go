@@ -37,6 +37,33 @@ func (a *Application) gitCommand(ctx context.Context, global globalOptions, args
 	}
 }
 
+func (a *Application) backupCommand(ctx context.Context, global globalOptions, args []string) error {
+	var err error
+	global, args, err = parseLeadingGlobals(global, args)
+	if err != nil {
+		return err
+	}
+	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
+		fmt.Fprint(a.IO.Out, `Usage: kit backup <command>
+
+Commands:
+  list                List backups owned by the configured work branch
+  create              Create a manual work backup
+  restore <branch>    Restore work from a kit backup branch
+  cleanup             Remove automatic backups (--dry-run, --all)
+`)
+		return nil
+	}
+	mapped := append([]string(nil), args...)
+	switch mapped[0] {
+	case "list":
+		mapped[0] = "backups"
+	case "create":
+		mapped[0] = "backup"
+	}
+	return a.gitWork(ctx, global, mapped)
+}
+
 func (a *Application) selfCommand(ctx context.Context, global globalOptions, args []string) error {
 	var err error
 	global, args, err = parseLeadingGlobals(global, args)
@@ -80,15 +107,17 @@ func parseLeadingGlobals(global globalOptions, args []string) (globalOptions, []
 }
 
 func printGitHelp(w interface{ Write([]byte) (int, error) }) {
-	fmt.Fprint(w, `Usage: kit git <command>
+	fmt.Fprint(w, `Usage: kit git <command>  (legacy compatibility)
+
+Prefer: kit status · kit pick · kit sync · kit review · kit backup
 
 Commands:
   status    Show the configured branch workflow and synchronization state
   compare   Compare source commits with a base branch
   pick      Select pending commits and apply them to a new review branch
   sync      Fast-forward the base and rebuild work from pending commits
-  publish   Push the current review branch and print its review URL
-  review    Submit, track, finish, and list GitLab MRs or Forgejo PRs
+  publish   Legacy push-only flow; prefer 'kit review submit'
+  review    Submit, track, finish, and list Gitea pull requests
   work      Manage work backups created by sync
 `)
 }

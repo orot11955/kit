@@ -11,10 +11,10 @@ concurrency:
 
 jobs:
   deploy:
-    runs-on: ubuntu-24.04
+    runs-on: kit-deploy
     steps:
       - name: Checkout
-        uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: https://gitea.com/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
@@ -22,7 +22,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          [[ "${FORGEJO_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${GITHUB_SHA}" =~ ^[0-9a-f]{40}$ ]]
           for file in site/index.html site/styles.css site/app.js site/favicon.svg install.sh; do
             test -s "$file"
           done
@@ -31,7 +31,7 @@ jobs:
           mkdir -p .dist/site
           cp site/index.html site/styles.css site/app.js site/favicon.svg .dist/site/
           cp install.sh .dist/site/install.sh
-          site_marker="<meta name=\"kit-site-id\" content=\"$FORGEJO_SHA\" />"
+          site_marker="<meta name=\"kit-site-id\" content=\"$GITHUB_SHA\" />"
           awk -v marker="$site_marker" '
             /<\/head>/ { print "    " marker; inserted++ }
             { print }
@@ -71,13 +71,13 @@ jobs:
         run: |
           set -Eeuo pipefail
           remote_head=$(git ls-remote origin refs/heads/main | awk '{print $1}')
-          [[ "$remote_head" == "$FORGEJO_SHA" ]] || {
+          [[ "$remote_head" == "$GITHUB_SHA" ]] || {
             echo "main advanced to $remote_head; skipping stale deployment" >&2
             exit 1
           }
           ssh_options=(-i "$HOME/.ssh/kit_deploy_key" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -p "$DEPLOY_PORT")
           ssh "${ssh_options[@]}" "$DEPLOY_USER@$DEPLOY_HOST" \
-            "upload-site $FORGEJO_SHA" < .dist/kit-site.tar.gz
+            "upload-site $GITHUB_SHA" < .dist/kit-site.tar.gz
 
       - name: Verify public site
         shell: bash
@@ -91,7 +91,7 @@ jobs:
             --connect-timeout 5 --max-time 30
           )
           mkdir -p .dist/public-site
-          site_marker="<meta name=\"kit-site-id\" content=\"$FORGEJO_SHA\" />"
+          site_marker="<meta name=\"kit-site-id\" content=\"$GITHUB_SHA\" />"
           fetch_site_once() {
             local asset url
             for asset in index.html styles.css app.js favicon.svg install.sh; do
@@ -111,7 +111,7 @@ jobs:
             sleep $((attempt * 2))
           done
           [[ $public_verified == true ]] || {
-            echo "public site does not expose deployment id $FORGEJO_SHA" >&2
+            echo "public site does not expose deployment id $GITHUB_SHA" >&2
             exit 1
           }
           echo "Public verification failure stops this workflow and never requests server rollback."

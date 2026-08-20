@@ -6,10 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -30,6 +33,7 @@ type reviewSubmitOptions struct {
 	wait               bool
 	removeSourceBranch bool
 	confirmed          bool
+	pushAttempted      *bool
 }
 
 type reviewWaitOptions struct {
@@ -42,6 +46,7 @@ type reviewFinishOptions struct {
 	branch      string
 	forceDelete bool
 	confirmed   bool
+	displayName string
 }
 
 type reviewResult struct {
@@ -51,6 +56,10 @@ type reviewResult struct {
 	Sync     *workflow.SyncResult `json:"sync,omitempty"`
 	Warnings []string             `json:"warnings,omitempty"`
 }
+
+type insecureHTTPWarningContextKey struct{}
+
+const insecureHTTPWarning = "Gitea token과 review API 데이터가 암호화되지 않은 HTTP로 전송됩니다."
 
 func (a *Application) gitReview(ctx context.Context, global globalOptions, args []string) error {
 	var err error
@@ -67,6 +76,7 @@ func (a *Application) gitReview(ctx context.Context, global globalOptions, args 
 		printReviewHelp(a.IO.Out)
 		return nil
 	}
+	ctx = withInsecureHTTPWarningOnce(ctx)
 	switch command {
 	case "submit":
 		opts, parsedGlobal, err := parseReviewSubmit(global, rest)
@@ -247,6 +257,7 @@ func parseAllGlobals(global globalOptions, args []string) (globalOptions, []stri
 }
 
 func (a *Application) reviewSubmit(ctx context.Context, global globalOptions, opts reviewSubmitOptions, serviceOverride *gitservice.Service) error {
+	ctx = withInsecureHTTPWarningOnce(ctx)
 	if global.json && !global.yes && !opts.confirmed {
 		return clierror.New(clierror.Usage, "review submit --json requires --yes")
 	}
@@ -284,14 +295,15 @@ func (a *Application) reviewSubmit(ctx context.Context, global globalOptions, op
 			return clierror.Wrap(clierror.Failure, err, "replace completed review state")
 		}
 	}
-	if state.TargetBranch != config.Base {
-		return clierror.New(clierror.Conflict, "review target is %s, but repository base is %s", state.TargetBranch, config.Base)
+	if state.SourceBranch != config.Source || state.TargetBranch != config.Base {
+		return clierror.New(clierror.Conflict, "review workflow changed since pick (source %s, target %s); restore the repository config before submit", state.SourceBranch, state.TargetBranch)
 	}
 
 	repository, err := reviewRepository(ctx, service, config)
 	if err != nil {
 		return err
 	}
+	warnInsecureHTTP(ctx, a.IO.ErrOut, repository)
 	client, err := a.ReviewClient(repository)
 	if err != nil {
 		return clierror.Wrap(clierror.Failure, err, "initialize review provider before push")
@@ -340,6 +352,9 @@ func (a *Application) reviewSubmit(ctx context.Context, global globalOptions, op
 	expectedUpstream := config.Remote + "/" + branch
 	if upstream != "" && upstream != expectedUpstream {
 		return clierror.New(clierror.Conflict, "current branch tracks %s, expected %s", upstream, expectedUpstream)
+	}
+	if opts.pushAttempted != nil {
+		*opts.pushAttempted = true
 	}
 	if err := service.PushCurrent(ctx, config.Remote, branch, upstream == ""); err != nil {
 		return clierror.Wrap(clierror.Failure, err, "push %s", branch)
@@ -398,8 +413,12 @@ func (a *Application) reviewSubmit(ctx context.Context, global globalOptions, op
 		return clierror.Wrap(clierror.Failure, err, "save open review state")
 	}
 	result := reviewResult{State: state, Pushed: true, Reused: reused}
-	if repository.Provider == "forgejo" && opts.removeSourceBranch {
-		result.Warnings = append(result.Warnings, "Forgejo remote branch cleanup follows the server/repository policy; kit does not delete it directly.")
+	if (repository.Provider == "gitea" || repository.Provider == "forgejo") && opts.removeSourceBranch {
+		providerName := "Gitea"
+		if repository.Provider == "forgejo" {
+			providerName = "Forgejo"
+		}
+		result.Warnings = append(result.Warnings, providerName+" remote branch cleanup follows the server and repository policy; kit does not delete it directly.")
 	}
 	if opts.wait {
 		if !global.json {
@@ -410,6 +429,13 @@ func (a *Application) reviewSubmit(ctx context.Context, global globalOptions, op
 		return a.reviewWaitWithService(ctx, global, reviewWaitOptions{branch: branch, interval: 15 * time.Second}, service)
 	}
 	return a.printReviewResult(global, "review submit", result)
+}
+
+func withInsecureHTTPWarningOnce(ctx context.Context) context.Context {
+	if _, ok := ctx.Value(insecureHTTPWarningContextKey{}).(*sync.Once); ok {
+		return ctx
+	}
+	return context.WithValue(ctx, insecureHTTPWarningContextKey{}, &sync.Once{})
 }
 
 func (a *Application) reviewStatus(ctx context.Context, global globalOptions, branch string) error {
@@ -438,68 +464,88 @@ func (a *Application) reviewWaitWithService(ctx context.Context, global globalOp
 	if opts.interval == 0 {
 		opts.interval = 15 * time.Second
 	}
-	var timeout <-chan time.Time
-	var timer *time.Timer
+	var cancelTimeout context.CancelFunc
 	if opts.timeout > 0 {
-		timer = time.NewTimer(opts.timeout)
-		defer timer.Stop()
-		timeout = timer.C
+		waitCtx, cancelTimeout = context.WithTimeout(waitCtx, opts.timeout)
+		defer cancelTimeout()
 	}
 	announced := false
+	transientFailures := 0
 	for {
 		state, _, err := a.refreshReview(waitCtx, service, opts.branch)
 		if err != nil {
 			if waitCtx.Err() != nil {
-				return clierror.Wrap(clierror.Interrupt, waitCtx.Err(), "review wait interrupted")
+				return reviewWaitContextError(waitCtx.Err())
 			}
-			return err
-		}
-		switch state.Status {
-		case review.StatusMerged:
-			if global.json {
+			if !isTransientReviewError(err) {
+				return err
+			}
+			transientFailures++
+			if !global.json {
+				renderer := a.renderer(global)
+				renderer.Warning("Retry", fmt.Sprintf("Gitea API 응답 지연 · %s 후 다시 확인 (%d회)", opts.interval, transientFailures))
+			}
+		} else {
+			transientFailures = 0
+			switch state.Status {
+			case review.StatusMerged:
+				if global.json {
+					if global.yes {
+						return a.reviewFinishWithService(waitCtx, global, reviewFinishOptions{branch: state.Branch, confirmed: true}, service)
+					}
+					return writeJSON(a.IO.Out, reviewResult{State: state})
+				}
+				renderer := a.renderer(global)
+				renderer.Notice("머지 완료")
+				renderer.Success("Review", fmt.Sprintf("%s → %s", state.Branch, state.TargetBranch))
 				if global.yes {
-					return a.reviewFinishWithService(waitCtx, global, reviewFinishOptions{branch: state.Branch, confirmed: true}, service)
+					return a.reviewFinishWithService(waitCtx, global, reviewFinishOptions{branch: state.Branch}, service)
 				}
-				return writeJSON(a.IO.Out, reviewResult{State: state})
-			}
-			renderer := a.renderer(global)
-			renderer.Notice("머지 완료")
-			renderer.Success("Review", fmt.Sprintf("%s → %s", state.Branch, state.TargetBranch))
-			if global.yes {
-				return a.reviewFinishWithService(waitCtx, global, reviewFinishOptions{branch: state.Branch}, service)
-			}
-			if isTerminal(a.IO.Out) && a.IO.InFile != nil && isTerminal(a.IO.InFile) {
-				finish, err := confirmDefaultYes(a.IO.In, a.IO.Out, "\n동기화와 로컬 브랜치 정리를 진행하시겠습니까? [Y/n] ")
-				if err != nil {
-					return err
+				if isTerminal(a.IO.Out) && a.IO.InFile != nil && isTerminal(a.IO.InFile) {
+					finish, err := confirmDefaultYes(a.IO.In, a.IO.Out, "\n동기화와 로컬 브랜치 정리를 진행하시겠습니까? [Y/n] ")
+					if err != nil {
+						return err
+					}
+					if finish {
+						return a.reviewFinishWithService(waitCtx, global, reviewFinishOptions{branch: state.Branch, confirmed: true}, service)
+					}
 				}
-				if finish {
-					return a.reviewFinishWithService(waitCtx, global, reviewFinishOptions{branch: state.Branch, confirmed: true}, service)
-				}
+				renderer.Next("kit review finish " + ui.ShellQuote(state.Branch))
+				return nil
+			case review.StatusClosed:
+				return clierror.New(clierror.Conflict, "review for %s was closed without merge", state.Branch)
 			}
-			renderer.Next("kit git review finish " + ui.ShellQuote(state.Branch))
-			return nil
-		case review.StatusClosed:
-			return clierror.New(clierror.Conflict, "review for %s was closed without merge", state.Branch)
-		}
-		if !announced && !global.json {
-			renderer := a.renderer(global)
-			renderer.Command("review wait")
-			renderer.Field("Review", fmt.Sprintf("%s → %s", state.Branch, state.TargetBranch))
-			renderer.Field("Poll", opts.interval.String())
-			announced = true
+			if !announced && !global.json {
+				renderer := a.renderer(global)
+				renderer.Command("review wait")
+				renderer.Field("Review", fmt.Sprintf("%s → %s", state.Branch, state.TargetBranch))
+				renderer.Field("Poll", opts.interval.String())
+				announced = true
+			}
 		}
 		poll := time.NewTimer(opts.interval)
 		select {
 		case <-waitCtx.Done():
 			poll.Stop()
-			return clierror.Wrap(clierror.Interrupt, waitCtx.Err(), "review wait interrupted")
-		case <-timeout:
-			poll.Stop()
-			return clierror.New(clierror.Failure, "review wait timed out; state was kept")
+			return reviewWaitContextError(waitCtx.Err())
 		case <-poll.C:
 		}
 	}
+}
+
+func isTransientReviewError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var networkError net.Error
+	return errors.As(err, &networkError) && networkError.Timeout()
+}
+
+func reviewWaitContextError(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return clierror.New(clierror.Failure, "review wait timed out; state was kept")
+	}
+	return clierror.Wrap(clierror.Interrupt, err, "review wait interrupted")
 }
 
 func (a *Application) reviewFinish(ctx context.Context, global globalOptions, opts reviewFinishOptions) error {
@@ -518,6 +564,10 @@ func (a *Application) reviewFinishWithService(ctx context.Context, global global
 	if err != nil {
 		return err
 	}
+	return a.reviewFinishResolvedWithService(ctx, global, opts, service, state, remoteReview)
+}
+
+func (a *Application) reviewFinishResolvedWithService(ctx context.Context, global globalOptions, opts reviewFinishOptions, service gitservice.Service, state reviewstate.State, remoteReview review.Review) error {
 	if remoteReview.Status != review.StatusMerged {
 		return clierror.New(clierror.Conflict, "review %s is %s; finish requires a merged review", state.Branch, remoteReview.Status)
 	}
@@ -576,7 +626,11 @@ func (a *Application) reviewFinishWithService(ctx context.Context, global global
 	}
 	if !opts.confirmed && !global.yes {
 		renderer := a.renderer(global)
-		renderer.Command("review finish")
+		displayName := opts.displayName
+		if displayName == "" {
+			displayName = "review finish"
+		}
+		renderer.Command(displayName)
 		renderer.Field("Review", fmt.Sprintf("%s → %s · merged", state.Branch, state.TargetBranch))
 		renderer.Field("Actions", fmt.Sprintf("%s 동기화 · 로컬 %s 삭제", config.Source, state.Branch))
 		ok, err := confirm(a.IO.In, a.IO.Out, "\n동기화와 로컬 브랜치 정리를 진행하시겠습니까? [y/N] ")
@@ -642,7 +696,11 @@ func (a *Application) reviewFinishWithService(ctx context.Context, global global
 	if err := reviewstate.Save(ctx, service, state); err != nil {
 		return clierror.Wrap(clierror.Failure, err, "save cleaned review state")
 	}
-	return a.printReviewResult(global, "review finish", reviewResult{State: state, Sync: syncResult})
+	displayName := opts.displayName
+	if displayName == "" {
+		displayName = "review finish"
+	}
+	return a.printReviewResult(global, displayName, reviewResult{State: state, Sync: syncResult})
 }
 
 func (a *Application) reviewList(ctx context.Context, global globalOptions) error {
@@ -659,17 +717,34 @@ func (a *Application) reviewList(ctx context.Context, global globalOptions) erro
 	}
 	renderer := a.renderer(global)
 	renderer.Command("review list")
+	renderer.Section("추적 중인 리뷰")
 	if len(states) == 0 {
 		renderer.Field("State", "추적 중인 리뷰가 없습니다.")
 		return nil
 	}
 	for _, state := range states {
-		renderer.Field(string(state.Stage), fmt.Sprintf("%s → %s", state.Branch, state.TargetBranch))
+		value := fmt.Sprintf("%s → %s · %s", state.Branch, state.TargetBranch, reviewStageLabel(state.Stage))
+		switch state.Stage {
+		case reviewstate.StageMerged, reviewstate.StageSynced, reviewstate.StageCleaned:
+			renderer.Success("Review", value)
+		case reviewstate.StageClosed:
+			renderer.Warning("Review", value)
+		default:
+			renderer.Pending("Review", value)
+		}
 	}
 	return nil
 }
 
 func (a *Application) refreshReview(ctx context.Context, service gitservice.Service, branch string) (reviewstate.State, review.Review, error) {
+	return a.readReview(ctx, service, branch, true)
+}
+
+func (a *Application) inspectReview(ctx context.Context, service gitservice.Service, branch string) (reviewstate.State, review.Review, error) {
+	return a.readReview(ctx, service, branch, false)
+}
+
+func (a *Application) readReview(ctx context.Context, service gitservice.Service, branch string, persist bool) (reviewstate.State, review.Review, error) {
 	resolved, err := resolveReviewBranch(ctx, service, branch)
 	if err != nil {
 		return reviewstate.State{}, review.Review{}, err
@@ -682,6 +757,9 @@ func (a *Application) refreshReview(ctx context.Context, service gitservice.Serv
 		return state, review.Review{}, clierror.New(clierror.Conflict, "review branch %s has not been submitted", state.Branch)
 	}
 	config := service.WorkflowConfig(ctx)
+	if state.SourceBranch != config.Source || state.TargetBranch != config.Base {
+		return state, review.Review{}, clierror.New(clierror.Conflict, "review workflow changed since submit (source %s, target %s); restore the repository config before refresh", state.SourceBranch, state.TargetBranch)
+	}
 	repository, err := reviewRepository(ctx, service, config)
 	if err != nil {
 		return state, review.Review{}, err
@@ -689,6 +767,10 @@ func (a *Application) refreshReview(ctx context.Context, service gitservice.Serv
 	if state.Provider != repository.Provider || state.Remote != config.Remote {
 		return state, review.Review{}, clierror.New(clierror.Conflict, "review state provider or remote no longer matches repository config")
 	}
+	if !reviewStateOriginMatchesRepository(state, repository) {
+		return state, review.Review{}, clierror.New(clierror.Conflict, "review state URL origin no longer matches repository remote")
+	}
+	warnInsecureHTTP(ctx, a.IO.ErrOut, repository)
 	client, err := a.ReviewClient(repository)
 	if err != nil {
 		return state, review.Review{}, clierror.Wrap(clierror.Failure, err, "initialize review provider")
@@ -715,8 +797,10 @@ func (a *Application) refreshReview(ctx context.Context, service gitservice.Serv
 	if err := updateReviewState(&state, remoteReview); err != nil {
 		return state, remoteReview, err
 	}
-	if err := reviewstate.Save(ctx, service, state); err != nil {
-		return state, remoteReview, clierror.Wrap(clierror.Failure, err, "save refreshed review state")
+	if persist {
+		if err := reviewstate.Save(ctx, service, state); err != nil {
+			return state, remoteReview, clierror.Wrap(clierror.Failure, err, "save refreshed review state")
+		}
 	}
 	return state, remoteReview, nil
 }
@@ -780,10 +864,42 @@ func reviewRepository(ctx context.Context, service gitservice.Service, config gi
 		return hosting.Repository{}, clierror.Wrap(clierror.Failure, err, "read remote %s", config.Remote)
 	}
 	repository := hosting.Resolve(config.Provider, remoteURL)
-	if repository.Provider != "gitlab" && repository.Provider != "forgejo" {
+	repository.AllowInsecureHTTP = config.AllowInsecureHTTP
+	if repository.Provider != "gitea" && repository.Provider != "gitlab" && repository.Provider != "forgejo" {
 		return hosting.Repository{}, clierror.New(clierror.Failure, "provider %q does not support automated reviews", repository.Provider)
 	}
 	return repository, nil
+}
+
+func warnInsecureHTTP(ctx context.Context, writer io.Writer, repository hosting.Repository) {
+	if !repository.InsecureHTTPAllowed() {
+		return
+	}
+	write := func() {
+		renderer := ui.Renderer{Writer: writer}
+		renderer.Notice("보안 경고")
+		renderer.Warning("HTTP", insecureHTTPWarning)
+	}
+	if once, ok := ctx.Value(insecureHTTPWarningContextKey{}).(*sync.Once); ok {
+		once.Do(write)
+		return
+	}
+	write()
+}
+
+func reviewStateOriginMatchesRepository(state reviewstate.State, repository hosting.Repository) bool {
+	if state.ReviewURL == "" || repository.Host == "" {
+		return true
+	}
+	parsed, err := url.Parse(state.ReviewURL)
+	if err != nil {
+		return false
+	}
+	expectedScheme := "https"
+	if repository.InsecureHTTPAllowed() {
+		expectedScheme = "http"
+	}
+	return parsed.Scheme == expectedScheme && parsed.Host == repository.Host
 }
 
 func resolveReviewBranch(ctx context.Context, service gitservice.Service, branch string) (string, error) {
@@ -903,14 +1019,20 @@ func (a *Application) printReviewResult(global globalOptions, command string, re
 	if result.Pushed {
 		renderer.Success("Push", result.State.Remote+"/"+result.State.Branch)
 	}
+	renderer.Section("리뷰")
 	if result.State.ReviewNumber > 0 {
 		label := "Review"
+		marker := "!"
 		if result.State.Provider == "gitlab" {
 			label = "GitLab MR"
 		} else if result.State.Provider == "forgejo" {
 			label = "Forgejo PR"
+			marker = "#"
+		} else if result.State.Provider == "gitea" {
+			label = "Gitea PR"
+			marker = "#"
 		}
-		value := fmt.Sprintf("!%d (%s)", result.State.ReviewNumber, result.State.Status)
+		value := fmt.Sprintf("%s%d (%s)", marker, result.State.ReviewNumber, result.State.Status)
 		if result.Reused {
 			value += " · 기존 리뷰 재사용"
 		}
@@ -918,7 +1040,14 @@ func (a *Application) printReviewResult(global globalOptions, command string, re
 	}
 	renderer.Field("Branch", result.State.Branch)
 	renderer.Field("Target", result.State.TargetBranch)
-	renderer.Field("Stage", string(result.State.Stage))
+	switch result.State.Stage {
+	case reviewstate.StageMerged, reviewstate.StageSynced, reviewstate.StageCleaned:
+		renderer.Success("State", reviewStageLabel(result.State.Stage))
+	case reviewstate.StageClosed:
+		renderer.Warning("State", reviewStageLabel(result.State.Stage))
+	default:
+		renderer.Pending("State", reviewStageLabel(result.State.Stage))
+	}
 	if result.State.ReviewURL != "" {
 		renderer.Field("URL", result.State.ReviewURL)
 	}
@@ -929,9 +1058,9 @@ func (a *Application) printReviewResult(global globalOptions, command string, re
 		renderer.Warning("Notice", warning)
 	}
 	if result.State.Stage == reviewstate.StageOpen {
-		renderer.Next("kit git review wait " + ui.ShellQuote(result.State.Branch))
+		renderer.Next("kit review wait " + ui.ShellQuote(result.State.Branch))
 	} else if result.State.Stage == reviewstate.StageMerged {
-		renderer.Next("kit git review finish " + ui.ShellQuote(result.State.Branch))
+		renderer.Next("kit review finish " + ui.ShellQuote(result.State.Branch))
 	}
 	return nil
 }
@@ -951,10 +1080,10 @@ func isProtectedReviewBranch(branch string, config gitservice.WorkflowConfig) bo
 }
 
 func printReviewHelp(w io.Writer) {
-	fmt.Fprint(w, `Usage: kit git review <command>
+	fmt.Fprint(w, `Usage: kit review <command>
 
 Commands:
-  submit [options]    Push the current branch and create or reuse an MR/PR
+  submit [options]    Push the current branch and create or reuse a Gitea PR
   status [branch]     Refresh one review from its provider
   wait [branch]       Wait until a review is merged or closed
   finish [branch]     Sync work and delete the merged local review branch
@@ -964,9 +1093,9 @@ Submit options:
   --title <text>              Override the generated title
   --description <text>        Override the generated description
   --description-file <path>   Read the description from a file (max 1 MiB)
-  --draft                     Create a draft review
+  --draft                     Prefix a Gitea PR title with "WIP: "
   --wait                      Wait for merge after submit
-  --keep-source-branch        Ask GitLab to keep the remote branch
+  --keep-source-branch        Suppress cleanup request; Gitea server policy still applies
 
 Wait options:
   --interval <duration>       Poll interval (default 15s, minimum 5s)

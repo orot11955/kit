@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	requestTimeout   = 15 * time.Second
+	requestTimeout   = 60 * time.Second
 	maxResponseBytes = 2 << 20
 )
 
@@ -30,8 +30,8 @@ func (c apiClient) validateReview(item Review) error {
 	}
 	base, baseErr := url.Parse(c.baseURL)
 	reviewURL, reviewErr := url.Parse(item.URL)
-	if baseErr != nil || reviewErr != nil || reviewURL.Host != base.Host {
-		return errors.New("review API response URL does not match repository host")
+	if baseErr != nil || reviewErr != nil || reviewURL.Scheme != base.Scheme || reviewURL.Host != base.Host {
+		return errors.New("review API response URL does not match repository host and scheme")
 	}
 	return nil
 }
@@ -46,8 +46,8 @@ func secureHTTPClient(input *http.Client, origin *url.URL) *http.Client {
 		if len(via) >= 10 {
 			return errors.New("too many review API redirects")
 		}
-		if request.URL.Scheme != "https" || request.URL.Host != origin.Host {
-			return errors.New("review API redirect changed HTTPS origin")
+		if request.URL.Scheme != origin.Scheme || request.URL.Host != origin.Host {
+			return errors.New("review API redirect changed HTTPS origin or the explicitly allowed HTTP origin")
 		}
 		return nil
 	}
@@ -80,6 +80,9 @@ func (c apiClient) doJSON(ctx context.Context, method, endpoint string, body any
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if strings.Contains(err.Error(), "server gave HTTP response to HTTPS client") {
+			return fmt.Errorf("review API request failed: server does not speak HTTPS; configure an HTTPS reverse proxy or, for a private literal-IP Gitea remote, set git.allow-insecure-http=true: %w", err)
 		}
 		return fmt.Errorf("review API request failed: %w", err)
 	}

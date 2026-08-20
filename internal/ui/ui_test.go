@@ -10,12 +10,14 @@ func TestRendererKeepsMeaningWithoutColor(t *testing.T) {
 	var output bytes.Buffer
 	renderer := Renderer{Writer: &output}
 	renderer.Command("review submit")
+	renderer.Section("Review")
 	renderer.Success("Push", "origin/feat/login")
+	renderer.Pending("State", "open")
 	renderer.Warning("Sync", "필요")
-	renderer.Next("kit git review finish")
+	renderer.Next("kit sync")
 
 	got := output.String()
-	for _, want := range []string{"kit · review submit", "✓ Push", "! Sync", "$ kit git review finish"} {
+	for _, want := range []string{"kit · review submit", "Review", "✓ Push", "● State", "! Sync", "$ kit sync"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("output does not contain %q:\n%s", want, got)
 		}

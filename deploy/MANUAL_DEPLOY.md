@@ -1,6 +1,6 @@
-# Forgejo 없이 수동 배포
+# Gitea 없이 수동 배포
 
-이 절차는 Forgejo 서버가 복구될 때까지 build host에서 archive를 만들고, 기존
+이 절차는 Gitea 서버 또는 Runner를 사용할 수 없을 때 build host에서 archive를 만들고, 기존
 forced-command SSH 경로로 apps-prod에 전달한다. 서버에서 임의 shell을 실행하거나 배포
 script를 archive에 포함하지 않는다.
 
@@ -10,10 +10,10 @@ script를 archive에 포함하지 않는다.
   OpenSSH client
 - apps-prod와 edge: [README.md](./README.md)에 따라 origin, TLS, 방화벽, wrapper 준비 완료
 - build host에 이 프로젝트 source가 Git clone 이외의 안전한 방법으로 복사되어 있음
-- manual 전용 임시 private key와 검증된 apps-prod SSH host key가 있음. Forgejo Runner
+- manual 전용 임시 private key와 검증된 apps-prod SSH host key가 있음. Gitea Runner
   private key와 공유하지 않음
 
-CLI의 `compare`, `pick` 및 관련 test는 local system `git`을 사용한다. Forgejo 서버는
+CLI의 `compare`, `pick` 및 관련 test는 local system `git`을 사용한다. Gitea 서버는
 필요하지 않지만 build host의 `git` 실행 파일은 필요하다.
 
 아래 예시는 프로젝트 root에서 실행한다. 먼저 변수와 SSH 연결 대상을 실제 값으로 둔다.
@@ -42,9 +42,9 @@ forced command identity를 제거하지 않는다.
 from="BUILD_HOST_IP",restrict,command="/usr/local/libexec/kit-ssh-wrapper manual" ssh-ed25519 AAAA... kit-manual-deploy
 ```
 
-Forgejo용 key는 별도 keypair와 별도 line
-`command="/usr/local/libexec/kit-ssh-wrapper forgejo"`를 사용한다. manual key를 Forgejo
-secret에 넣거나 Forgejo key를 수동 build host에 복사하지 않는다.
+Gitea용 key는 별도 keypair와 별도 line
+`command="/usr/local/libexec/kit-ssh-wrapper gitea"`를 사용한다. manual key를 Gitea
+secret에 넣거나 Gitea key를 수동 build host에 복사하지 않는다.
 
 host key는 별도 신뢰 경로로 확인해 build host의 `known_hosts`에 미리 등록한다. 배포 명령은
 `StrictHostKeyChecking=yes`를 사용하며 host key 검증을 끄지 않는다.
@@ -62,7 +62,7 @@ make check
 수동 docs에는 Git commit이 없으므로 marker를 넣기 전 정적 파일 manifest의 SHA-256 앞
 40자를 식별자로 사용한다. 그 ID를 `index.html`의 `kit-site-id` meta로 넣은 뒤 archive를
 만든다. archive 자체의 hash를 archive 안에 넣는 순환 구조가 아니다. 이 값은 형식만
-40자리 hex일 뿐 **실제 Git commit SHA가 아니다**. Forgejo가 복구되면 자동 배포는 실제
+40자리 hex일 뿐 **실제 Git commit SHA가 아니다**. Gitea 자동 배포는 실제
 main commit SHA를 marker와 배포 ID로 사용한다.
 
 ```sh
@@ -301,7 +301,7 @@ HOME="$KIT_TEST_HOME" SHELL=/bin/bash sh /tmp/kit-install.sh
 개를 소비하지 않는다. 첫 실제 version을 수동 배포하고, 다음 정식 version 또는 endpoint
 설정 기능이 생겼을 때 E2E를 수행하는 것이 안전하다.
 
-## Forgejo 복구 후
+## Gitea 자동 배포 전환 후
 
 1. 임시 manual public key를 apps-prod `authorized_keys`에서 제거한다.
 2. 임시 private key를 build host에서 안전하게 폐기한다.

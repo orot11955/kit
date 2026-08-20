@@ -28,6 +28,7 @@ Repository-local commands:
 
 Keys:
   git.provider  git.remote  git.stable  git.base  git.source
+  git.allow-insecure-http
 `)
 		return nil
 	}
@@ -108,7 +109,7 @@ func (a *Application) printWorkflowConfig(config gitservice.WorkflowConfig, json
 	if jsonOutput {
 		return writeJSON(a.IO.Out, config)
 	}
-	fmt.Fprintf(a.IO.Out, "git.provider=%s\ngit.remote=%s\ngit.stable=%s\ngit.base=%s\ngit.source=%s\n", config.Provider, config.Remote, config.Stable, config.Base, config.Source)
+	fmt.Fprintf(a.IO.Out, "git.provider=%s\ngit.remote=%s\ngit.stable=%s\ngit.base=%s\ngit.source=%s\ngit.allow-insecure-http=%t\n", config.Provider, config.Remote, config.Stable, config.Base, config.Source, config.AllowInsecureHTTP)
 	return nil
 }
 
@@ -169,7 +170,7 @@ func (a *Application) doctor(ctx context.Context, global globalOptions, args []s
 		synced, _ := service.IsAncestor(ctx, config.Base, config.Source)
 		message := "source contains base"
 		if !synced {
-			message = "source is stale; run kit git sync"
+			message = "source is stale; run kit sync"
 			result.OK = false
 		}
 		result.Checks = append(result.Checks, doctorCheck{Name: "work sync", OK: synced, Message: message})

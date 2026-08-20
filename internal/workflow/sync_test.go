@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -120,6 +121,84 @@ func TestSyncConflictWithoutResolverKeepsOriginalWork(t *testing.T) {
 	}
 	if got := output(t, dir, "status", "--porcelain"); got != "" {
 		t.Fatalf("working tree dirty after conflict: %s", got)
+	}
+	if refs := output(t, dir, "for-each-ref", "--format=%(refname:short)", "refs/heads/kit/backup"); refs != "" {
+		t.Fatalf("verified rollback left its automatic backup behind: %s", refs)
+	}
+}
+
+func TestSyncConflictRollsBackFastForwardedBaseAndRemovesBackup(t *testing.T) {
+	dir, _ := syncRepository(t)
+	baseBefore := output(t, dir, "rev-parse", "develop")
+	run(t, dir, "switch", "-c", "work")
+	writeCommit(t, dir, "root.txt", "work\n", "work conflict")
+	originalWork := output(t, dir, "rev-parse", "work")
+
+	run(t, dir, "switch", "develop")
+	if err := os.WriteFile(filepath.Join(dir, "root.txt"), []byte("team\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, dir, "add", "root.txt")
+	run(t, dir, "commit", "-m", "team conflict")
+	run(t, dir, "push", "origin", "develop")
+	run(t, dir, "switch", "work")
+	run(t, dir, "branch", "-f", "develop", baseBefore)
+	run(t, dir, "switch", "develop")
+
+	service := gitservice.Service{Dir: dir}
+	_, err := Sync(context.Background(), service, SyncOptions{Config: gitservice.DefaultWorkflowConfig()})
+	if err == nil || !strings.Contains(err.Error(), "rollback backup") {
+		t.Fatalf("expected verified rollback, got %v", err)
+	}
+	if got := output(t, dir, "rev-parse", "develop"); got != baseBefore {
+		t.Fatalf("base was not rolled back: got %s want %s", got, baseBefore)
+	}
+	if got := output(t, dir, "rev-parse", "work"); got != originalWork {
+		t.Fatalf("work was not rolled back: got %s want %s", got, originalWork)
+	}
+	if got := output(t, dir, "branch", "--show-current"); got != "develop" {
+		t.Fatalf("checkout not restored: %s", got)
+	}
+	if refs := output(t, dir, "for-each-ref", "--format=%(refname:short)", "refs/heads/kit/backup"); refs != "" {
+		t.Fatalf("automatic backup remained after verified rollback: %s", refs)
+	}
+}
+
+func TestRefreshConflictRestoresWorkAndRemovesAutomaticBackup(t *testing.T) {
+	dir, _ := syncConflictRepository(t)
+	originalWork := output(t, dir, "rev-parse", "work")
+	service := gitservice.Service{Dir: dir}
+	_, err := Refresh(context.Background(), service, gitservice.DefaultWorkflowConfig(), false)
+	if err == nil || !strings.Contains(err.Error(), "rollback backup") {
+		t.Fatalf("expected refresh rollback, got %v", err)
+	}
+	if got := output(t, dir, "rev-parse", "work"); got != originalWork {
+		t.Fatalf("refresh changed work after failure: got %s want %s", got, originalWork)
+	}
+	if got := output(t, dir, "branch", "--show-current"); got != "work" {
+		t.Fatalf("refresh did not restore checkout: %s", got)
+	}
+	if refs := output(t, dir, "for-each-ref", "--format=%(refname:short)", "refs/heads/kit/backup"); refs != "" {
+		t.Fatalf("refresh left its automatic rollback backup: %s", refs)
+	}
+}
+
+func TestSyncCleanupFailureRetainsNamedBackup(t *testing.T) {
+	dir, _ := syncConflictRepository(t)
+	service := gitservice.Service{
+		Dir: dir,
+		Runner: failBranchDeleteRunner{
+			Runner: gitservice.ExecRunner{},
+			match:  "kit/backup/",
+		},
+	}
+	_, err := Sync(context.Background(), service, SyncOptions{Config: gitservice.DefaultWorkflowConfig()})
+	if err == nil || !strings.Contains(err.Error(), "rollback backup remains at kit/backup/v2/") {
+		t.Fatalf("expected retained backup guidance, got %v", err)
+	}
+	refs := output(t, dir, "for-each-ref", "--format=%(refname:short)", "refs/heads/kit/backup")
+	if !strings.HasPrefix(refs, "kit/backup/v2/") {
+		t.Fatalf("failed cleanup did not retain backup: %q", refs)
 	}
 }
 
@@ -329,6 +408,21 @@ func TestSyncConflictAbortAfterExternalResolutionPreservesRecoveryBranch(t *test
 	if got := output(t, dir, "for-each-ref", "--format=%(refname)", "refs/heads/kit/tmp"); got != "" {
 		t.Fatalf("temporary sync branch remained after recovery: %s", got)
 	}
+	if got := output(t, dir, "for-each-ref", "--format=%(refname)", "refs/heads/kit/backup"); got != "" {
+		t.Fatalf("recovery branch should not require retaining a verified rollback backup: %s", got)
+	}
+}
+
+type failBranchDeleteRunner struct {
+	gitservice.Runner
+	match string
+}
+
+func (r failBranchDeleteRunner) Run(ctx context.Context, dir string, args ...string) ([]byte, error) {
+	if len(args) == 3 && args[0] == "branch" && args[1] == "-D" && strings.HasPrefix(args[2], r.match) {
+		return nil, errors.New("injected branch deletion failure")
+	}
+	return r.Runner.Run(ctx, dir, args...)
 }
 
 func syncConflictRepository(t *testing.T) (string, string) {

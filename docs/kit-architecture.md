@@ -28,8 +28,7 @@ $HOME/.local/bin/kit compare
 # 새 terminal부터 PATH로 사용
 kit compare
 kit pick feat/login
-kit pick feat/login --submit
-kit pick feat/login --submit --wait
+kit pick feat/login --wait
 
 # 이후 업데이트
 kit update
@@ -161,14 +160,17 @@ branch 역할은 다음으로 고정한다.
 main     안정 version과 release tag 기준
 develop  여러 개발자의 review branch가 합쳐지는 통합 branch
 work     원격에 push하지 않는 local commit queue
-feat/*   develop에서 만들어 GitLab MR 또는 Forgejo PR로 올리는 일회성 branch
+feat/*   develop에서 만들어 Gitea PR로 올리는 일회성 branch
 ```
 
 다른 개발자의 merge로 `develop`이 바뀌면 `work`에 단순 merge하지 않는다. merge conflict
 해결이 merge commit에만 남으면 이후 개별 work commit을 뽑을 때 그 해결을 재사용할 수 없기
-때문이다. `kit git sync`는 `origin/develop`을 fast-forward한 뒤 기존 work backup을 만들고,
-최신 develop에서 미반영 work commit만 위상 순서대로 재적용한다. 재구성 실패 시 기존 work를
-그대로 유지한다. 재적용 충돌은 임시 branch에서 해결하며 `[c] continue`, `[s] skip`,
+때문이다. `kit sync`는 `origin/develop`을 fast-forward한 뒤 기존 work backup을 만들고,
+최신 develop에서 미반영 work commit만 위상 순서대로 재적용한다. 재구성 실패 시 기존 work,
+원 checkout과 이번 실행 전 develop hash를 복원하고 모두 검증한다. 검증에 성공한 경우 그
+실패 실행에서 생성한 자동 backup을 삭제하며, 복원 또는 삭제를 검증하지 못하면 backup을
+남기고 정확한 이름을 오류에 포함한다. 재적용 충돌은 임시 branch에서 해결하며
+`[c] continue`, `[s] skip`,
 `[a] abort` 중 하나를 선택한다. continue 전에 충돌 파일을 수정하고 `git add`해야 한다.
 외부 IDE에서 해결 commit까지 만든 경우에는 변경된 임시 branch HEAD를 감지해 continue로
 처리한다.
@@ -178,16 +180,33 @@ skip한 commit은 결과의 `skipped`로 표시되고 backup에는 남는다. �
 `work` branch를 이동하지 않는다.
 
 ```bash
-kit git status
-kit git sync --dry-run
-kit git sync
-kit git work backups
-kit git work restore <backup-branch>
+kit status
+kit status --cached
+kit sync --dry-run
+kit sync
+kit backup list
+kit backup restore <backup-branch>
+kit backup cleanup --dry-run
+kit backup cleanup [--all]
 ```
 
+`cleanup`의 기본 대상은 현재 source branch에 대해 sync/refresh가 자동 생성한 backup이다.
+`--all`은 같은 source의 manual backup과 restore 전 safety backup까지 포함한다. 삭제 전에는
+목록과 확인을 제공하고 `--dry-run`은 아무 ref도 변경하지 않는다. `kit/recovery/*`와
+`kit/tmp/*`는 이 명령의 대상이 아니다. restore가 실패한 경우에도 source ref와 원 checkout을
+safety backup으로 복원·검증한 뒤 그 실패 실행에서 만든 safety backup만 삭제한다. 성공한
+restore의 safety backup은 명시적으로 cleanup할 때까지 유지한다.
+
+신규 backup ref는 `kit/backup/v2/<source-sha256>/<kind>/<id>` 형식으로 source 소유권과
+종류를 분리한다. 구버전의 `/`→`-` 형식은 서로 다른 source를 구분할 수 없으므로 source가
+정확히 `work`인 legacy ref만 list/restore/cleanup에서 호환한다. 다른 source의 legacy ref는
+`git branch --list 'kit/backup/*'`로 읽기 전용 확인 후 운영자가 직접 판단한다.
+
 `develop`이 `work`의 ancestor가 아니면 work는 `STALE`이다. `kit compare`는 경고와 상태를
-표시하지만 read-only로 실행한다. `kit pick`은 기본적으로 중단하고 `kit git sync`를
-안내한다. 장애 복구에만 `--allow-stale`을 명시적으로 사용할 수 있다.
+표시하지만 read-only로 실행한다. 기본 `kit pick`은 원격 base를 fetch하고 동기화가
+필요하면 `kit sync`를 먼저 실행한다. 사용자 지정 `--from`/`--base` 흐름에서는 branch
+계약을 자동으로 추정하지 않고 `kit sync`를 안내한다. 장애 복구에만 `--allow-stale`을
+명시적으로 사용할 수 있다.
 
 `pick`은 commit을 하나씩 적용하고 `$(git rev-parse --git-path kit)/pick-state.json`에
 진행 상태를 저장한다. process가 끝나도 다음 명령으로 이어갈 수 있다.
@@ -202,51 +221,102 @@ continue는 임의로 `git add -A`하지 않는다. 사용자가 해결한 파�
 
 ## 3.4 Git hosting provider
 
-local Git workflow는 server에 종속되지 않는다. 회사·협업 repository에는 GitLab을,
-개인 repository와 kit 배포에는 Forgejo를 사용한다. provider별 차이는 hosting adapter가
-MR/PR API 계약으로 흡수한다.
+local Git workflow는 server에 종속되지 않는다. 회사·협업 repository와 개인 repository,
+kit 배포는 모두 Gitea를 사용한다. provider별 차이는 hosting adapter가 PR API 계약으로
+흡수한다.
 
 ```bash
 kit config init
-kit config set git.provider gitlab
-kit config set git.provider forgejo
+kit config set git.provider gitea
 ```
 
 repository local 설정은 `.git/config`의 `kit.git.*` key를 사용한다.
+신규 repository의 기본 provider는 `gitea`다. `gitlab`·`forgejo` 값은 전환 중인 기존
+설정을 읽고 같은 값으로 보존하는 경우에만 허용하며 새로 설정할 수 없다.
 
 ```text
-git.provider = auto | gitlab | forgejo | generic
+git.provider = auto | gitea | generic
 git.remote   = origin
 git.stable   = main
 git.base     = develop
 git.source   = work
+git.allow-insecure-http = false | true
 ```
 
+`git.allow-insecure-http`의 기본값은 `false`다. `true`여도 remote URL에 `http://`가
+명시되어 있고 host가 RFC1918, loopback 또는 link-local literal IP인 Gitea에만 적용한다.
+DNS hostname, public IP, SSH/scp remote에는 적용하지 않으며 remote scheme을 보고 자동으로
+downgrade하지 않는다. redirect와 API가 반환한 review URL도 최초 scheme과 `host[:port]`가
+정확히 같아야 한다. HTTP를 사용하는 모든 review command는 token이 평문 전송된다는 경고를
+stderr에 출력한다.
+
+HTTP review URL은 기존 schema 1 state에 저장되지만 HTTPS-only 구버전 kit는 해당 state를
+읽지 못한다. binary를 downgrade하기 전에는 진행 중인 HTTP review를 finish/cleaned 상태로
+정리하거나 `.git/kit/reviews/`를 별도로 백업한다. 설정을 unset하거나 `false`로 바꾸면 새
+API 요청은 즉시 HTTPS 기본값으로 돌아간다.
+
 `kit git publish`는 `main`, `develop`, `work` push를 차단하고 현재 review branch만 push한다.
-GitLab/Forgejo API token은 필요로 하지 않으며 provider에 맞는 MR/PR 생성 주소를 출력한다.
+Gitea API token은 필요로 하지 않으며 provider에 맞는 PR 생성 주소를 출력한다.
 `kit git publish`는 기존 호환을 위해 push와 review 생성 URL 출력만 담당한다. 실제 review
 수명주기는 별도 namespace에서 관리한다.
 
 ```bash
-kit git review submit
-kit git review status [branch]
-kit git review wait [branch]
-kit git review finish [branch]
-kit git review list
+kit review submit
+kit review status [branch]
+kit review wait [branch]
+kit review finish [branch]
+kit review list
 ```
 
 `submit`은 현재 branch를 push한 다음 같은 source/target의 열린 review를 정확히 조회한다.
-하나면 재사용하고, 없으면 GitLab MR 또는 Forgejo PR을 생성하며, 둘 이상이면 임의 선택하지
-않고 중단한다. `pick --submit`은 pick 완료 상태를 먼저 저장한 뒤 이 동작을 이어서 실행한다.
+하나면 재사용하고, 없으면 Gitea PR을 생성하며, 둘 이상이면 임의 선택하지
+않고 중단한다. `kit pick`은 기본적으로 submit까지 수행하며 local branch 생성 전에 provider와
+credential을 preflight한다. `--local`은 push와 PR 생성 없이 local branch만 만든다.
+pick 완료 뒤 push 시도 전 submit이 실패하면 원 checkout을 검증하고 생성한 branch와 picked
+state를 삭제한다. push 시도가 시작된 뒤에는 원격 반영 여부를 단정할 수 없으므로 local
+branch와 review state를 보존해 같은 submit/status/wait 명령으로 복구한다.
+
+상위 `kit sync`는 active review state를 provider에서 먼저 갱신한다. 머지된 review가 하나면
+동일한 finish 검증과 work 재구성, local branch 삭제를 한 transaction으로 실행한다. 동시에
+머지된 review가 여러 개면 순서를 추정하지 않고 `kit review finish <branch>`를 요구한다.
+`--base-only`는 review API를 의도적으로 건너뛰는 복구 경로다. 기존 `kit git sync`는 자동
+review finish를 수행하지 않는 호환 동작으로 유지한다.
+
+상위 `kit status`는 active review를 provider에서 갱신하지만 전체 조회에 5초 제한을 둔다.
+제한 안에 확인하지 못한 review는 저장된 상태와 refresh 경고를 함께 표시한다. `--cached`는
+provider 요청 없이 저장된 review 상태만 읽는 빠른 경로다.
 
 상태는 `.git/kit/reviews/<branch-sha256>.json`에 atomic write하며 token은 기록하지 않는다.
-GitLab은 `KIT_GITLAB_TOKEN`, self-hosted host는 `KIT_GITLAB_HOST`를 사용한다. `gitlab.com`만
-host 기본값을 허용한다. Forgejo는 `KIT_FORGEJO_TOKEN`과 `KIT_FORGEJO_HOST`가 모두
-필수다. host는 remote의 정확한 소문자 HTTPS origin과 일치해야 하며 redirect로 origin이
-바뀌면 요청을 차단한다.
+Gitea token은 `kit auth login gitea --host <host>`로 macOS Keychain 또는 Linux Secret
+Service에 host별로 등록한다. keyring 자체가 profile을 열거하지 못하므로 kit는 token이
+없는 profile metadata만 user config directory에 보관한다. Linux keyring backend가 없는
+경우에는 명시적 동의로, macOS Keychain 장애 시에는 `--store file`을 직접 지정한 경우에만
+mode `0600` local credential file을 사용할 수 있다. macOS에서는 자동 우회하지 않으며,
+backend가 잠겼거나 권한 오류가 난 경우에도 file로 자동 우회하지 않는다. project 설정,
+Git config, review state, JSON 출력과 log에는 token을 기록하지 않는다.
+
+`KIT_GITEA_TOKEN`과 `KIT_GITEA_HOST`는 CI/일회성 override로만 지원하며 반드시 함께
+지정한다. 환경 변수 쌍이 있으면 저장 credential보다 우선하고, 불완전한 쌍이면 실패한다.
+host는 remote의 정확한 소문자 `host[:port]`와 일치해야 한다. 기본 HTTPS 또는 명시적으로
+허용한 사설 IP HTTP origin에서 scheme이나 host가 바뀌는 redirect는 차단한다. 제품명이
+드러나지 않는 사설 hostname은 `auto`로 판별하지 않고
+`git.provider=gitea`를 요구한다.
+PR 생성에 필요한 최소 API scope는 `write:repository`다. Git push는 이 API token을 쓰지
+않고 기존 SSH key 또는 Git credential helper를 사용한다.
+기존 `gitlab`·`forgejo` 설정과 schema 1 review state는 전환 중인 작업을 진단하고 복구할
+수 있도록 호환 읽기와 기존 adapter를 유지하지만 신규 설정에는 사용하지 않는다.
+Gitea create PR API에 공통 draft field가 없으므로 `--draft`는 `WIP: ` title prefix로
+표현하고 server의 `WORK_IN_PROGRESS_PREFIXES`에 해당 prefix를 유지한다. remote source
+branch 삭제 여부는 Gitea repository 정책에 맡기며 API token으로 임의 삭제하지 않는다.
+현재 adapter는 configured remote를 push 대상과 PR base repository로 함께 사용한다. 따라서
+같은 repository의 branch PR만 지원하며 fork → upstream PR은 별도의 head owner/remote 계약을
+추가하기 전까지 명시적으로 지원하지 않는다.
 
 `wait`는 daemon이나 OS notification을 추가하지 않는 foreground polling이다. merge가
-확인되면 알림과 다음 명령을 출력한다. `--yes`를 주면 `finish`까지 이어간다. `finish`는
+확인되면 알림과 다음 명령을 출력한다. 개별 provider 요청 timeout은 60초이며 일시적 network
+timeout은 stderr에 retry 상태를 표시하고 다음 poll에서 다시 요청한다. 명시적인 인증·계약
+오류는 즉시 중단하고 `Ctrl-C` 또는 전체 `--timeout`은 state를 유지한 채 종료한다.
+`--yes`를 주면 `finish`까지 이어간다. `finish`는
 provider가 merge한 review인지, local branch가 submit 시점 tip과 같은지 확인한 후에만
 `develop` fetch/fast-forward와 `work` 재구성을 실행한다. review state에 보존한 원본 work
 commit 목록은 squash merge에서도 해당 작업을 안전하게 제거하는 신뢰 집합으로 사용한다.
@@ -337,7 +407,7 @@ kit/
 │   ├── apps-prod/
 │   └── edge/
 │
-└── .forgejo/
+└── .gitea/
     └── workflows/
         ├── ci.yml
         ├── docs.yml
@@ -416,7 +486,7 @@ https://kit.2juho.com/downloads/vX.Y.Z/kit_linux_amd64
 https://kit.2juho.com/downloads/vX.Y.Z/checksums.txt
 ```
 
-installer는 JSON parser나 Forgejo API를 사용하지 않는다. `version.txt`는 `vX.Y.Z` 한
+installer는 JSON parser나 Gitea API를 사용하지 않는다. `version.txt`는 `vX.Y.Z` 한
 줄만 허용하며 installer가 형식을 검증한다. version directory는 release 후 변경하지
 않으므로 binary와 checksum이 다른 build에서 섞이지 않는다.
 
@@ -455,7 +525,7 @@ hostname을 관리한다. `kit.2juho.com`은 Cloudflare DNS-only record로 publi
 edge Nginx reverse proxy를 재사용하고 설정은 직접 관리한다. edge가 TLS를 종료하고
 apps-prod의 사설 IP `18080`에 있는 Docker 정적 origin으로 전달한다. public endpoint는
 정적 docs, installer, release metadata와 download file만 제공하며 apps-prod origin port,
-private Forgejo, Forgejo Runner, SSH deploy endpoint는 외부에 노출하지 않는다.
+private Gitea, Gitea Runner, SSH deploy endpoint는 외부에 노출하지 않는다.
 
 ## 7.1 단일 페이지 구성
 
@@ -471,7 +541,7 @@ OS별 직접 다운로드 button
 현재 version / build commit / 배포 시각
 최근 변경 내용
 kit update 사용법
-private Forgejo source는 public page에 노출하지 않음
+private Gitea source는 public page에 노출하지 않음
 ```
 
 초기 웹은 `site/index.html`, `styles.css`, `app.js`로 구현한다. React나 별도 static site
@@ -541,7 +611,7 @@ download에는 실행 권한이 필요하지 않으며 installer가 검증 후 l
 새 docs 또는 release는 임시 directory에서 검증한 후 symlink를 atomic하게 교체한다.
 문제 발생 시 symlink를 직전 directory로 되돌려 rollback한다.
 
-Proxmox 내부의 CI Runner 서버와 배포 서버는 분리한다. Forgejo Runner는 build 결과를
+Proxmox 내부의 CI Runner 서버와 배포 서버는 분리한다. Gitea Runner는 build 결과를
 제한된 SSH deploy 계정으로 배포 서버의 staging directory에 전송한다. deploy 계정은
 `/srv/data/apps/kit/data` 아래의 staging 배치, 검증, symlink 교체에 필요한
 권한만 가진다. SSH key에는
@@ -596,9 +666,13 @@ vX.Y.Z tag push
 - cleanup은 새 release의 smoke test와 `current-release` 교체가 성공한 뒤 실행한다.
 - 현재 release와 rollback 대상인 직전 release는 cleanup 도중 삭제하지 않는다.
 
-Forgejo Actions workflow는 `.forgejo/workflows/`에 두며 Forgejo Runner가 test, build,
-deploy를 실행한다. Runner는 배포 서버의 일반 shell 계정이나 다른 Proxmox service에
-접근할 권한을 갖지 않는다.
+Gitea Actions workflow는 `.gitea/workflows/`에 둔다. untrusted PR을 검사하는 `kit-ci`
+Runner와 배포 secret을 사용하는 `kit-deploy` Runner는 OS account, work directory, cache,
+등록 token과 network 권한을 분리한다. deploy Runner는 보호된 main/tag workflow만 받고
+배포 서버의 forced-command SSH endpoint 외 다른 Proxmox service에 접근하지 않는다.
+label 자체는 권한 경계가 아니므로 홈 kit repository는 배포 책임자만 branch write가
+가능하게 제한한다. 다른 개발자에게 same-repository write를 허용할 때는 배포 workflow와
+secret을 PR을 받지 않는 별도 deployment repository/Gitea scope로 먼저 분리한다.
 
 ---
 
@@ -669,9 +743,10 @@ https://kit.2juho.com/release.json 조회
 - stale work에서 pick 차단
 - sync 성공 시 applied commit 제거와 pending commit 보존
 - sync conflict의 continue / skip / abort와 실제 pending/skipped 수
-- sync abort 또는 입력 종료 시 기존 work와 checkout 복원
+- sync abort 또는 입력 종료 시 기존 work, checkout, 갱신된 base 복원과 실패 backup 정리
+- work backup cleanup의 dry-run, 확인, 기본/`--all` 범위와 부분 삭제 실패
 - local/remote target branch 충돌 차단
-- GitLab/Forgejo remote URL과 review 주소 생성
+- Gitea remote URL과 review 주소 생성
 
 ## CI / Deploy smoke test
 
@@ -733,23 +808,24 @@ kit update
 ## v0.3 — 협업 Git workflow
 
 ```text
-kit git status
-kit git sync
-kit git publish
-kit git review submit / status / wait / finish / list
-kit pick --submit / --wait
-kit git work refresh / backups / restore
+kit status
+kit sync
+kit pick / --local / --wait
+kit review submit / status / wait / finish / list
+kit backup list / create / restore / cleanup
+legacy kit git namespace compatibility
+kit auth login / status / list / logout
 repository-local kit.git.* config
-GitLab / Forgejo provider 분리
+Gitea provider와 legacy provider 호환
 중단 가능한 pick state
 ```
 
 완료 조건:
 
 - 다른 개발자의 merge 후 최신 develop 위에 pending work commit만 재구성한다.
-- sync 실패 시 기존 work와 backup으로 복구할 수 있다.
+- sync 실패 시 기존 work, checkout과 develop을 검증된 상태로 되돌리고 실패 backup을 정리한다.
 - stale work에서는 새 review branch 생성을 차단한다.
-- 협업 GitLab과 개인 Forgejo repository에서 같은 local 명령을 사용한다.
+- 회사와 개인 Gitea repository에서 같은 local 명령을 사용한다.
 - review 생성, merge 확인, work sync와 안전한 local branch 정리를 한 흐름으로 실행한다.
 - release tag는 origin/main에 포함된 commit만 허용한다.
 
@@ -787,8 +863,8 @@ dotfiles는 현재 version roadmap에서 제외한다. 명령 기능이 충분�
 - network: Cloudflare HTTP proxy 사용 안 함
 - access: Cloudflare DNS-only를 통한 인터넷 직접 공개
 - HTTPS: 기존 reverse proxy와 인증서 관리 체계 재사용
-- source: 협업 project는 GitLab, 개인 project와 kit source는 private Forgejo repository
-- CI/CD: 업무 project는 GitLab CI 정책, kit은 Forgejo Actions와 Forgejo Runner
+- source: 협업 project, 개인 project와 kit source는 각 환경의 private Gitea repository
+- CI/CD: 업무 project와 kit은 각 Gitea instance의 Actions와 분리된 Gitea Runner 정책 사용
 - Proxmox: 개발, 배포, metrics, CI Runner 서버 분리
 - deploy: CI Runner에서 제한된 SSH 계정으로 배포 서버에 전송
 - `main` push: docs만 배포
