@@ -23,7 +23,16 @@ func (a *Application) gitCommand(ctx context.Context, global globalOptions, args
 	case "compare":
 		return a.compare(ctx, global, args[1:])
 	case "pick":
-		return a.pick(ctx, global, args[1:])
+		legacyArgs := append([]string(nil), args[1:]...)
+		if !legacyPickRequestsRemote(legacyArgs) {
+			legacyArgs = append(legacyArgs, "--local")
+		}
+		if !global.json {
+			renderer := a.renderer(global)
+			renderer.Notice("호환 명령")
+			renderer.Warning("kit git pick", "기본 동작은 로컬 브랜치 생성입니다. 원격 리뷰 흐름은 kit pick을 사용하세요.")
+		}
+		return a.pick(ctx, global, legacyArgs)
 	case "sync":
 		return a.gitSync(ctx, global, args[1:])
 	case "publish":
@@ -35,6 +44,15 @@ func (a *Application) gitCommand(ctx context.Context, global globalOptions, args
 	default:
 		return clierror.New(clierror.Usage, "unknown git command %q\nRun 'kit git help' for usage.", args[0])
 	}
+}
+
+func legacyPickRequestsRemote(args []string) bool {
+	for _, arg := range args {
+		if arg == "--submit" || arg == "--wait" {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *Application) backupCommand(ctx context.Context, global globalOptions, args []string) error {

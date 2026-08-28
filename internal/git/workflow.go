@@ -164,6 +164,17 @@ func (s Service) Upstream(ctx context.Context) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+func (s Service) UpstreamForBranch(ctx context.Context, branch string) (string, error) {
+	if err := s.ValidateBranchName(ctx, branch); err != nil {
+		return "", err
+	}
+	out, err := s.run(ctx, "for-each-ref", "--format=%(upstream:short)", "refs/heads/"+branch)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 func (s Service) PushCurrent(ctx context.Context, remote, branch string, setUpstream bool) error {
 	if err := validateRemoteName(remote); err != nil {
 		return err

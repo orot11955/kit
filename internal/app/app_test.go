@@ -16,8 +16,18 @@ import (
 
 	"kit/internal/buildinfo"
 	"kit/internal/clierror"
+	gitservice "kit/internal/git"
+	"kit/internal/review"
 	"kit/internal/selector"
 )
+
+type createOnlyReviewClient struct{}
+
+func (createOnlyReviewClient) Create(context.Context, review.CreateRequest) (review.Review, error) {
+	return review.Review{}, nil
+}
+
+var _ review.Client = createOnlyReviewClient{}
 
 func TestParseCompareFlagsInAnyOrder(t *testing.T) {
 	opts, help, err := parseCompare(globalOptions{cwd: "."}, []string{"work-2", "--limit", "4", "--base=main", "--json", "--cwd", "/tmp/repo"})
@@ -44,12 +54,123 @@ func TestParsePickSubmitsByDefaultAndLocalOptOut(t *testing.T) {
 	if !defaultOptions.submit || defaultOptions.localOnly {
 		t.Fatalf("pick should submit by default: %#v", defaultOptions)
 	}
+	if !defaultOptions.submit {
+		t.Fatalf("default pick should submit and return after Create: %#v", defaultOptions)
+	}
+	noWaitOptions, _, err := parsePick(globalOptions{cwd: "."}, []string{"feat/no-wait", "--no-wait"})
+	if err != nil || !noWaitOptions.submit {
+		t.Fatalf("--no-wait should be accepted as a deprecated Create-only compatibility option: %#v, %v", noWaitOptions, err)
+	}
 	localOptions, _, err := parsePick(globalOptions{cwd: "."}, []string{"feat/local", "--local"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if localOptions.submit || !localOptions.localOnly {
 		t.Fatalf("--local should disable submit: %#v", localOptions)
+	}
+	allOptions, _, err := parsePick(globalOptions{cwd: "."}, []string{"feat/all", "--all", "--local"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !allOptions.all {
+		t.Fatalf("--all was not parsed: %#v", allOptions)
+	}
+}
+
+func TestCompareListsFirstParentCommitsFromMergedWork(t *testing.T) {
+	dir := appRepository(t)
+	gitCommand(t, dir, "switch", "-c", "work")
+	gitCommand(t, dir, "switch", "-c", "side")
+	if err := os.WriteFile(filepath.Join(dir, "side.txt"), []byte("side\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, dir, "add", "side.txt")
+	gitCommand(t, dir, "commit", "-m", "side")
+	gitCommand(t, dir, "switch", "work")
+	gitCommand(t, dir, "merge", "--no-ff", "side", "-m", "merge side")
+
+	a := &Application{IO: IO{In: strings.NewReader(""), Out: io.Discard, ErrOut: io.Discard}, Build: buildinfo.Current()}
+	if err := a.Run(context.Background(), []string{"compare", "--cwd", dir}); err != nil {
+		t.Fatalf("compare rejected merged work: %v", err)
+	}
+}
+
+func TestPickAllowsMergedBaseAlreadyContainedByWork(t *testing.T) {
+	dir := appRepository(t)
+	gitCommand(t, dir, "switch", "-c", "work")
+	if err := os.WriteFile(filepath.Join(dir, "feature.txt"), []byte("feature\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, dir, "add", "feature.txt")
+	gitCommand(t, dir, "commit", "-m", "feature")
+	gitCommand(t, dir, "switch", "develop")
+	if err := os.WriteFile(filepath.Join(dir, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, dir, "add", "base.txt")
+	gitCommand(t, dir, "commit", "-m", "base")
+	gitCommand(t, dir, "switch", "work")
+	workBefore := gitCommandOutput(t, dir, "rev-parse", "HEAD")
+	gitCommand(t, dir, "merge", "--no-ff", "develop", "-m", "merge base")
+	workAfter := gitCommandOutput(t, dir, "rev-parse", "HEAD")
+	a := &Application{IO: IO{In: strings.NewReader(""), Out: io.Discard, ErrOut: io.Discard}, Build: buildinfo.Current()}
+	if err := a.Run(context.Background(), []string{"pick", "feat/merged-base", "--all", "--local", "--yes", "--cwd", dir}); err != nil {
+		t.Fatal(err)
+	}
+	if got := gitCommandOutput(t, dir, "rev-parse", "work"); got != workAfter {
+		t.Fatalf("work changed: got %s want %s (pre-merge %s)", got, workAfter, workBefore)
+	}
+	if got := gitCommandOutput(t, dir, "show", "feat/merged-base:feature.txt"); got != "feature" {
+		t.Fatalf("target omitted pending feature: %q", got)
+	}
+	if got := gitCommandOutput(t, dir, "show", "feat/merged-base:base.txt"); got != "base" {
+		t.Fatalf("target was not based on develop: %q", got)
+	}
+}
+
+func TestPickSkipsSideMergeWithoutPreflightRejection(t *testing.T) {
+	dir := appRepository(t)
+	gitCommand(t, dir, "switch", "-c", "work")
+	gitCommand(t, dir, "switch", "-c", "side")
+	if err := os.WriteFile(filepath.Join(dir, "side.txt"), []byte("side\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, dir, "add", "side.txt")
+	gitCommand(t, dir, "commit", "-m", "side")
+	gitCommand(t, dir, "switch", "work")
+	gitCommand(t, dir, "merge", "--no-ff", "side", "-m", "merge side")
+	a := &Application{IO: IO{In: strings.NewReader(""), Out: io.Discard, ErrOut: io.Discard}, Build: buildinfo.Current()}
+	if err := a.Run(context.Background(), []string{"pick", "feat/reject-side", "--all", "--local", "--yes", "--cwd", dir}); err != nil {
+		t.Fatalf("pick rejected side merge: %v", err)
+	}
+	assertBranchMissing(t, dir, "feat/reject-side")
+	if commandSucceeds(dir, "rev-parse", "--verify", "HEAD:kit/pick-state.json") {
+		t.Fatal("pickstate was created before preflight rejection")
+	}
+}
+
+func TestLegacyGitPickDefaultsToLocalOnly(t *testing.T) {
+	dir := appRepository(t)
+	gitCommand(t, dir, "switch", "-c", "work")
+	if err := os.WriteFile(filepath.Join(dir, "legacy.txt"), []byte("legacy\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, dir, "add", "legacy.txt")
+	gitCommand(t, dir, "commit", "-m", "legacy local pick")
+	gitCommand(t, dir, "switch", "develop")
+
+	var output bytes.Buffer
+	a := &Application{
+		IO:     IO{In: strings.NewReader(""), Out: &output, ErrOut: &output},
+		Build:  buildinfo.Current(),
+		Select: func(items []selector.Item, _ string) ([]selector.Item, error) { return items, nil },
+	}
+	if err := a.Run(context.Background(), []string{"git", "pick", "feat/legacy", "--cwd", dir, "--yes"}); err != nil {
+		t.Fatal(err)
+	}
+	assertBranchExists(t, dir, "feat/legacy")
+	if !strings.Contains(output.String(), "호환 명령") || !strings.Contains(output.String(), "로컬 브랜치 생성") {
+		t.Fatalf("legacy pick did not explain local-only behavior:\n%s", output.String())
 	}
 }
 
@@ -237,6 +358,42 @@ func TestPickCreatesBranchAndAppliesSourceOrder(t *testing.T) {
 	}
 }
 
+func TestPickAllSelectsEveryPendingCommitWithoutSelector(t *testing.T) {
+	dir := appRepository(t)
+	gitCommand(t, dir, "switch", "-c", "work")
+	if err := os.WriteFile(filepath.Join(dir, "first.txt"), []byte("first\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, dir, "add", "first.txt")
+	gitCommand(t, dir, "commit", "-m", "first pending commit")
+	if err := os.WriteFile(filepath.Join(dir, "second.txt"), []byte("second\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, dir, "add", "second.txt")
+	gitCommand(t, dir, "commit", "-m", "second pending commit")
+	gitCommand(t, dir, "switch", "develop")
+
+	var output bytes.Buffer
+	a := &Application{
+		IO:    IO{In: strings.NewReader(""), Out: &output, ErrOut: &output},
+		Build: buildinfo.Current(),
+		Select: func([]selector.Item, string) ([]selector.Item, error) {
+			t.Fatal("--all opened the interactive selector")
+			return nil, nil
+		},
+	}
+	if err := a.Run(context.Background(), []string{"pick", "chore/all", "--all", "--local", "--cwd", dir, "--yes"}); err != nil {
+		t.Fatal(err)
+	}
+	log := gitCommandOutput(t, dir, "log", "--reverse", "--format=%s", "develop..chore/all")
+	if log != "first pending commit\nsecond pending commit" {
+		t.Fatalf("--all did not preserve every pending commit in source order:\n%s", log)
+	}
+	if !strings.Contains(output.String(), "선택한 커밋 · 2개") {
+		t.Fatalf("--all plan omitted its selected count:\n%s", output.String())
+	}
+}
+
 func TestPickRejectsDirtyTreeBeforeSelection(t *testing.T) {
 	dir := appRepository(t)
 	gitCommand(t, dir, "switch", "-c", "work")
@@ -304,6 +461,9 @@ func TestPickConflictAbortRestoresCheckoutAndDeletesTarget(t *testing.T) {
 		t.Fatalf("HEAD changed after abort: got %s want %s", head, originalHead)
 	}
 	assertBranchMissing(t, dir, "feat/conflict")
+	if marked, markerErr := (gitservice.Service{Dir: dir}).IsKitCreatedBranch(context.Background(), "feat/conflict"); markerErr != nil || marked {
+		t.Fatalf("Kit branch marker remained after pick abort: marked=%v err=%v", marked, markerErr)
+	}
 	if status := gitCommandOutput(t, dir, "status", "--porcelain"); status != "" {
 		t.Fatalf("working tree is dirty after abort: %s", status)
 	}
@@ -466,6 +626,334 @@ func TestGitSyncConflictPromptAbortKeepsWork(t *testing.T) {
 	}
 	if got := gitCommandOutput(t, dir, "rev-parse", "work"); got != originalWork {
 		t.Fatalf("work changed after sync abort: got %s want %s", got, originalWork)
+	}
+}
+
+func TestSyncDryRunReportsExcludedMergesInJSONAndHumanOutput(t *testing.T) {
+	dir := appRepository(t)
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	gitCommand(t, "", "init", "--bare", remote)
+	gitCommand(t, dir, "remote", "add", "origin", remote)
+	gitCommand(t, dir, "push", "-u", "origin", "develop")
+	gitCommand(t, dir, "switch", "-c", "work")
+	if err := os.WriteFile(filepath.Join(dir, "work.txt"), []byte("work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, dir, "add", "work.txt")
+	gitCommand(t, dir, "commit", "-m", "work")
+	gitCommand(t, dir, "switch", "-c", "side")
+	if err := os.WriteFile(filepath.Join(dir, "side.txt"), []byte("side\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, dir, "add", "side.txt")
+	gitCommand(t, dir, "commit", "-m", "side")
+	gitCommand(t, dir, "switch", "work")
+	gitCommand(t, dir, "merge", "--no-ff", "side", "-m", "merge side")
+
+	var human bytes.Buffer
+	a := &Application{IO: IO{In: strings.NewReader(""), Out: &human, ErrOut: &human}, Build: buildinfo.Current()}
+	if err := a.Run(context.Background(), []string{"sync", "--dry-run", "--cwd", dir}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(human.String(), "Excluded") || !strings.Contains(human.String(), "자동 backup") {
+		t.Fatalf("dry-run did not warn about excluded merge topology:\n%s", human.String())
+	}
+
+	var jsonOutput bytes.Buffer
+	a = &Application{IO: IO{In: strings.NewReader(""), Out: &jsonOutput, ErrOut: &jsonOutput}, Build: buildinfo.Current()}
+	if err := a.Run(context.Background(), []string{"sync", "--dry-run", "--json", "--cwd", dir}); err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		ExcludedMerges int `json:"excluded_merge_commits"`
+	}
+	if err := json.Unmarshal(jsonOutput.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.ExcludedMerges != 1 {
+		t.Fatalf("excluded merge count = %d, want 1", result.ExcludedMerges)
+	}
+
+	var actualJSON, warnings bytes.Buffer
+	a = &Application{IO: IO{In: strings.NewReader(""), Out: &actualJSON, ErrOut: &warnings}, Build: buildinfo.Current()}
+	if err := a.Run(context.Background(), []string{"sync", "--yes", "--json", "--cwd", dir}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(warnings.String(), "side-parent") || !strings.Contains(warnings.String(), "자동 backup") {
+		t.Fatalf("--yes did not emit exclusion warning to stderr:\n%s", warnings.String())
+	}
+	if err := json.Unmarshal(actualJSON.Bytes(), &result); err != nil {
+		t.Fatalf("--yes JSON stdout is not a single result: %v\n%s", err, actualJSON.String())
+	}
+	if result.ExcludedMerges != 1 {
+		t.Fatalf("actual excluded merge count = %d, want 1", result.ExcludedMerges)
+	}
+}
+
+func TestSyncCleansOnlyMarkedMergedCurrentReviewBranch(t *testing.T) {
+	dir := appRepository(t)
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	gitCommand(t, "", "init", "--bare", remote)
+	gitCommand(t, dir, "remote", "add", "origin", remote)
+	gitCommand(t, dir, "push", "-u", "origin", "develop")
+	gitCommand(t, dir, "switch", "-c", "work")
+	gitCommand(t, dir, "switch", "develop")
+	gitCommand(t, dir, "switch", "-c", "review/merged")
+	if err := os.WriteFile(filepath.Join(dir, "review.txt"), []byte("review\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, dir, "add", "review.txt")
+	gitCommand(t, dir, "commit", "-m", "review")
+	gitCommand(t, dir, "push", "-u", "origin", "review/merged")
+	gitCommand(t, dir, "switch", "develop")
+	gitCommand(t, dir, "merge", "--ff-only", "review/merged")
+	gitCommand(t, dir, "push", "origin", "develop")
+	gitCommand(t, dir, "branch", "-f", "work", "develop")
+	gitCommand(t, dir, "config", "--local", "branch.review/merged.kitCreated", "true")
+	gitCommand(t, dir, "switch", "review/merged")
+
+	var output bytes.Buffer
+	a := &Application{IO: IO{In: strings.NewReader(""), Out: &output, ErrOut: &output}, Build: buildinfo.Current()}
+	if err := a.Run(context.Background(), []string{"sync", "--yes", "--json", "--cwd", dir}); err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		Cleaned []string `json:"cleaned_branches"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Cleaned) != 1 || result.Cleaned[0] != "review/merged" {
+		t.Fatalf("unexpected cleaned branches: %#v", result.Cleaned)
+	}
+	assertBranchMissing(t, dir, "review/merged")
+	if got := gitCommandOutput(t, dir, "branch", "--show-current"); got != "work" {
+		t.Fatalf("cleanup did not switch from current review branch to work: %s", got)
+	}
+	if !commandSucceeds(dir, "show-ref", "--verify", "--quiet", "refs/remotes/origin/review/merged") {
+		t.Fatal("cleanup removed the remote tracking ref")
+	}
+	if commandSucceeds(dir, "config", "--local", "--get", "branch.review/merged.kitCreated") {
+		t.Fatal("marker remained after branch cleanup")
+	}
+}
+
+func TestSyncPreservesUnmarkedProtectedAndNonAncestorBranches(t *testing.T) {
+	dir := appRepository(t)
+	gitCommand(t, dir, "switch", "-c", "work")
+	gitCommand(t, dir, "switch", "develop")
+	gitCommand(t, dir, "branch", "review/unmarked")
+	gitCommand(t, dir, "switch", "-c", "review/unmerged")
+	if err := os.WriteFile(filepath.Join(dir, "unmerged.txt"), []byte("unmerged\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, dir, "add", "unmerged.txt")
+	gitCommand(t, dir, "commit", "-m", "unmerged")
+	gitCommand(t, dir, "config", "--local", "branch.review/unmerged.kitCreated", "true")
+	gitCommand(t, dir, "config", "--local", "branch.work.kitCreated", "true")
+
+	cleaned, warnings := cleanupSyncedKitBranches(context.Background(), gitservice.Service{Dir: dir}, gitservice.DefaultWorkflowConfig())
+	if len(cleaned) != 0 || len(warnings) != 0 {
+		t.Fatalf("unexpected cleanup for preserved branches: cleaned=%#v warnings=%#v", cleaned, warnings)
+	}
+	for _, branch := range []string{"review/unmarked", "review/unmerged", "work"} {
+		assertBranchExists(t, dir, branch)
+	}
+}
+
+func TestSyncDoesNotCleanMarkedBranchDuringDryRunBaseOnlyOrFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		args  []string
+		dirty bool
+	}{
+		{name: "dry-run", args: []string{"sync", "--dry-run", "--json"}},
+		{name: "base-only", args: []string{"sync", "--base-only", "--yes", "--json"}},
+		{name: "workflow failure", args: []string{"sync", "--yes", "--json"}, dirty: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := syncCleanupRepository(t)
+			gitCommand(t, dir, "branch", "review/marked")
+			gitCommand(t, dir, "config", "--local", "branch.review/marked.kitCreated", "true")
+			if tc.dirty {
+				if err := os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("dirty\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var output bytes.Buffer
+			a := &Application{IO: IO{In: strings.NewReader(""), Out: &output, ErrOut: &output}, Build: buildinfo.Current()}
+			args := append(append([]string(nil), tc.args...), "--cwd", dir)
+			err := a.Run(context.Background(), args)
+			if tc.dirty && err == nil {
+				t.Fatal("sync succeeded despite workflow planning failure")
+			}
+			if !tc.dirty && err != nil {
+				t.Fatal(err)
+			}
+			assertBranchExists(t, dir, "review/marked")
+			if marked, markerErr := (gitservice.Service{Dir: dir}).IsKitCreatedBranch(context.Background(), "review/marked"); markerErr != nil || !marked {
+				t.Fatalf("marker changed without successful cleanup: marked=%v err=%v", marked, markerErr)
+			}
+		})
+	}
+}
+
+func TestSyncPreservesCurrentMergedBranchWithUpstreamMismatch(t *testing.T) {
+	dir := syncCleanupRepository(t)
+	gitCommand(t, dir, "switch", "-c", "review/mismatch")
+	gitCommand(t, dir, "config", "--local", "branch.review/mismatch.kitCreated", "true")
+	gitCommand(t, dir, "config", "--local", "branch.review/mismatch.remote", "other")
+	gitCommand(t, dir, "config", "--local", "branch.review/mismatch.merge", "refs/heads/review/mismatch")
+
+	var output bytes.Buffer
+	a := &Application{IO: IO{In: strings.NewReader(""), Out: &output, ErrOut: &output}, Build: buildinfo.Current()}
+	if err := a.Run(context.Background(), []string{"sync", "--yes", "--json", "--cwd", dir}); err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		Cleaned  []string `json:"cleaned_branches"`
+		Warnings []string `json:"cleanup_warnings"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Cleaned) != 0 || len(result.Warnings) != 1 || !strings.Contains(result.Warnings[0], "upstream") {
+		t.Fatalf("unexpected mismatch cleanup result: %#v", result)
+	}
+	assertBranchExists(t, dir, "review/mismatch")
+	if got := gitCommandOutput(t, dir, "branch", "--show-current"); got != "review/mismatch" {
+		t.Fatalf("cleanup switched an upstream-mismatched branch: %s", got)
+	}
+}
+
+func TestSyncPreservesMarkedSquashEquivalentBranch(t *testing.T) {
+	dir := syncCleanupRepository(t)
+	gitCommand(t, dir, "switch", "-c", "review/squash")
+	if err := os.WriteFile(filepath.Join(dir, "squash.txt"), []byte("same patch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, dir, "add", "squash.txt")
+	gitCommand(t, dir, "commit", "-m", "review change")
+	gitCommand(t, dir, "config", "--local", "branch.review/squash.kitCreated", "true")
+	gitCommand(t, dir, "switch", "develop")
+	if err := os.WriteFile(filepath.Join(dir, "squash.txt"), []byte("same patch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, dir, "add", "squash.txt")
+	gitCommand(t, dir, "commit", "-m", "squash equivalent")
+	gitCommand(t, dir, "push", "origin", "develop")
+
+	var output bytes.Buffer
+	a := &Application{IO: IO{In: strings.NewReader(""), Out: &output, ErrOut: &output}, Build: buildinfo.Current()}
+	if err := a.Run(context.Background(), []string{"sync", "--yes", "--json", "--cwd", dir}); err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		Cleaned []string `json:"cleaned_branches"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Cleaned) != 0 {
+		t.Fatalf("squash-equivalent branch was cleaned without ancestry: %#v", result.Cleaned)
+	}
+	assertBranchExists(t, dir, "review/squash")
+}
+
+func TestSyncSafeDeleteFailureIsWarningAndDoesNotFailSync(t *testing.T) {
+	dir := syncCleanupRepository(t)
+	gitCommand(t, dir, "branch", "review/delete-failure")
+	gitCommand(t, dir, "config", "--local", "branch.review/delete-failure.kitCreated", "true")
+	var output bytes.Buffer
+	runner := &syncCleanupRunner{Runner: gitservice.ExecRunner{}, failDelete: "review/delete-failure"}
+	a := &Application{
+		IO:    IO{In: strings.NewReader(""), Out: &output, ErrOut: &output},
+		Git:   func(dir string) gitservice.Service { return gitservice.Service{Dir: dir, Runner: runner} },
+		Build: buildinfo.Current(),
+	}
+	if err := a.Run(context.Background(), []string{"sync", "--yes", "--json", "--cwd", dir}); err != nil {
+		t.Fatalf("safe deletion failure changed sync outcome: %v", err)
+	}
+	var result struct {
+		Warnings []string `json:"cleanup_warnings"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Warnings) != 1 || !strings.Contains(result.Warnings[0], "safe local branch deletion failed") {
+		t.Fatalf("safe delete warning missing: %#v", result.Warnings)
+	}
+	assertBranchExists(t, dir, "review/delete-failure")
+}
+
+func TestCleanupPreservesSameNameBranchRecreatedDuringInspection(t *testing.T) {
+	dir := syncCleanupRepository(t)
+	gitCommand(t, dir, "branch", "review/recreated")
+	gitCommand(t, dir, "config", "--local", "branch.review/recreated.kitCreated", "true")
+	gitCommand(t, dir, "switch", "-c", "replacement")
+	gitCommand(t, dir, "commit", "--allow-empty", "-m", "replacement")
+	replacementTip := gitCommandOutput(t, dir, "rev-parse", "HEAD")
+	gitCommand(t, dir, "switch", "develop")
+	runner := &syncCleanupRunner{Runner: gitservice.ExecRunner{}, replaceBranch: "review/recreated", replaceHash: replacementTip}
+	cleaned, warnings := cleanupSyncedKitBranches(context.Background(), gitservice.Service{Dir: dir, Runner: runner}, gitservice.DefaultWorkflowConfig())
+	if len(cleaned) != 0 || len(warnings) != 1 || !strings.Contains(warnings[0], "tip changed") {
+		t.Fatalf("recreated branch was not preserved: cleaned=%#v warnings=%#v", cleaned, warnings)
+	}
+	assertBranchExists(t, dir, "review/recreated")
+}
+
+type syncCleanupRunner struct {
+	gitservice.Runner
+	failDelete    string
+	replaceBranch string
+	replaceHash   string
+	revisionReads int
+}
+
+func (r *syncCleanupRunner) Run(ctx context.Context, dir string, args ...string) ([]byte, error) {
+	if len(args) == 3 && args[0] == "branch" && args[1] == "-d" && args[2] == r.failDelete {
+		return nil, errors.New("injected safe delete failure")
+	}
+	if len(args) == 3 && args[0] == "rev-parse" && args[1] == "--verify" && args[2] == r.replaceBranch+"^{commit}" {
+		r.revisionReads++
+		if r.revisionReads == 2 {
+			if _, err := r.Runner.Run(ctx, dir, "update-ref", "refs/heads/"+r.replaceBranch, r.replaceHash); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return r.Runner.Run(ctx, dir, args...)
+}
+
+func (r *syncCleanupRunner) RunInput(ctx context.Context, dir string, input []byte, args ...string) ([]byte, error) {
+	return r.Runner.RunInput(ctx, dir, input, args...)
+}
+
+func syncCleanupRepository(t *testing.T) string {
+	t.Helper()
+	dir := appRepository(t)
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	gitCommand(t, "", "init", "--bare", remote)
+	gitCommand(t, dir, "remote", "add", "origin", remote)
+	gitCommand(t, dir, "push", "-u", "origin", "develop")
+	gitCommand(t, dir, "switch", "-c", "work")
+	gitCommand(t, dir, "switch", "develop")
+	return dir
+}
+
+func TestCompareAndPickWarnWhenSourceMergesAreExcluded(t *testing.T) {
+	var compareOutput bytes.Buffer
+	a := &Application{IO: IO{Out: &compareOutput}}
+	a.printCompare(compareResult{Source: "work", Base: "develop", ExcludedMerges: 1}, false)
+	if !strings.Contains(compareOutput.String(), "first-parent 후보") {
+		t.Fatalf("compare did not warn about excluded merges:\n%s", compareOutput.String())
+	}
+
+	var pickOutput bytes.Buffer
+	a = &Application{IO: IO{Out: &pickOutput}}
+	a.printPickSummary(pickOptions{target: "feat/test", source: "work", base: "develop", excludedMerges: 1}, nil)
+	if !strings.Contains(pickOutput.String(), "선택 후보에 포함되지 않습니다") {
+		t.Fatalf("pick did not warn about excluded merges:\n%s", pickOutput.String())
 	}
 }
 

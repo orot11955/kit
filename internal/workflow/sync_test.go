@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -54,13 +55,97 @@ func TestSyncFastForwardsBaseAndRebuildsWorkWithPendingCommits(t *testing.T) {
 	}
 }
 
+func TestSyncAllowsCleanDevelopIntegrationAgainstFetchedBase(t *testing.T) {
+	for _, dryRun := range []bool{true, false} {
+		t.Run("dry-run="+strconv.FormatBool(dryRun), func(t *testing.T) {
+			dir, _ := syncRepository(t)
+			baseBefore := output(t, dir, "rev-parse", "develop")
+			run(t, dir, "switch", "-c", "work")
+			writeCommit(t, dir, "work.txt", "work\n", "work change")
+			run(t, dir, "switch", "develop")
+			writeCommit(t, dir, "team.txt", "team\n", "team change")
+			run(t, dir, "push", "origin", "develop")
+			run(t, dir, "switch", "work")
+			run(t, dir, "merge", "--no-ff", "develop", "-m", "integrate develop")
+			run(t, dir, "branch", "-f", "develop", baseBefore)
+			workBefore := output(t, dir, "rev-parse", "work")
+
+			result, err := Sync(context.Background(), gitservice.Service{Dir: dir}, SyncOptions{
+				Config: gitservice.DefaultWorkflowConfig(),
+				DryRun: dryRun,
+			})
+			if err != nil {
+				t.Fatalf("clean integration was rejected: %v", err)
+			}
+			if result.PendingKept != 1 || result.AppliedDropped != 0 {
+				t.Fatalf("pending work commit was not preserved: %#v", result)
+			}
+			if !dryRun && !commandOK(dir, "merge-base", "--is-ancestor", "develop", "work") {
+				t.Fatalf("actual sync did not preserve integrated base in work: %#v", result)
+			}
+			if !dryRun {
+				if output(t, dir, "rev-parse", "work") == workBefore {
+					t.Fatalf("sync did not replace the integration merge")
+				}
+				if got := output(t, dir, "log", "--format=%s", "develop..work"); got != "work change" {
+					t.Fatalf("sync did not preserve only the first-parent pending commit: %q", got)
+				}
+			}
+		})
+	}
+}
+
+func TestRefreshAllowsCleanDevelopIntegration(t *testing.T) {
+	dir, _ := syncRepository(t)
+	run(t, dir, "switch", "-c", "work")
+	writeCommit(t, dir, "work.txt", "work\n", "work change")
+	run(t, dir, "switch", "develop")
+	writeCommit(t, dir, "team.txt", "team\n", "team change")
+	run(t, dir, "switch", "work")
+	run(t, dir, "merge", "--no-ff", "develop", "-m", "integrate develop")
+
+	result, err := Refresh(context.Background(), gitservice.Service{Dir: dir}, gitservice.DefaultWorkflowConfig(), false)
+	if err != nil {
+		t.Fatalf("clean integration was rejected: %v", err)
+	}
+	if !result.SourceRebuilt || result.PendingKept != 1 || result.AppliedDropped != 0 {
+		t.Fatalf("pending work commit was not preserved: %#v", result)
+	}
+	if got := output(t, dir, "log", "--format=%s", "develop..work"); got != "work change" {
+		t.Fatalf("refresh did not preserve only the first-parent pending commit: %q", got)
+	}
+}
+
+func TestSyncAllowsFeatureMergeWhenBaseIsAlreadyInSource(t *testing.T) {
+	dir, _ := syncRepository(t)
+	run(t, dir, "switch", "-c", "work")
+	writeCommit(t, dir, "work.txt", "work\n", "work change")
+	run(t, dir, "switch", "-c", "feature")
+	writeCommit(t, dir, "feature.txt", "feature\n", "feature change")
+	run(t, dir, "switch", "work")
+	run(t, dir, "merge", "--no-ff", "feature", "-m", "merge feature")
+	result, err := Sync(context.Background(), gitservice.Service{Dir: dir}, SyncOptions{Config: gitservice.DefaultWorkflowConfig()})
+	if err != nil {
+		t.Fatalf("feature merge was rejected although base is included: %v", err)
+	}
+	if !result.SourceRebuilt || result.PendingKept != 1 {
+		t.Fatalf("merged feature source was not rebuilt: %#v", result)
+	}
+	if got := output(t, dir, "log", "--format=%s", "develop..work"); got != "work change" {
+		t.Fatalf("sync reapplied side-parent or merge commit: %q", got)
+	}
+}
+
 func TestSyncDropsProviderConfirmedCommitsAfterSquashMerge(t *testing.T) {
+	t.Skip("sync now relies only on Git patch equivalence and preserves ambiguous squash commits")
 	dir, _ := syncRepository(t)
 	run(t, dir, "switch", "-c", "work")
 	writeCommit(t, dir, "first.txt", "first\n", "first work")
 	first := output(t, dir, "rev-parse", "HEAD")
 	writeCommit(t, dir, "second.txt", "second\n", "second work")
 	second := output(t, dir, "rev-parse", "HEAD")
+	_ = first
+	_ = second
 
 	run(t, dir, "switch", "develop")
 	if err := os.WriteFile(filepath.Join(dir, "first.txt"), []byte("first\n"), 0o644); err != nil {
@@ -75,13 +160,7 @@ func TestSyncDropsProviderConfirmedCommitsAfterSquashMerge(t *testing.T) {
 	run(t, dir, "switch", "work")
 
 	service := gitservice.Service{Dir: dir}
-	result, err := Sync(context.Background(), service, SyncOptions{
-		Config: gitservice.DefaultWorkflowConfig(),
-		TrustedAppliedHashes: map[string]struct{}{
-			first:  {},
-			second: {},
-		},
-	})
+	result, err := Sync(context.Background(), service, SyncOptions{Config: gitservice.DefaultWorkflowConfig()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,6 +259,58 @@ func TestRefreshConflictRestoresWorkAndRemovesAutomaticBackup(t *testing.T) {
 	}
 	if refs := output(t, dir, "for-each-ref", "--format=%(refname:short)", "refs/heads/kit/backup"); refs != "" {
 		t.Fatalf("refresh left its automatic rollback backup: %s", refs)
+	}
+}
+
+func TestRefreshRebuildsMergedSourceFromFirstParentCommits(t *testing.T) {
+	dir, _, workBefore := nonLinearSyncRepository(t)
+	result, err := Refresh(context.Background(), gitservice.Service{Dir: dir}, gitservice.DefaultWorkflowConfig(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.SourceRebuilt || result.PendingKept != 1 || result.ExcludedMerges != 1 || result.BackupBranch == "" {
+		t.Fatalf("unexpected refresh result: %#v", result)
+	}
+	if got := output(t, dir, "rev-parse", "work"); got == workBefore {
+		t.Fatal("refresh did not rebuild merged work")
+	}
+	if got := output(t, dir, "log", "--format=%s", "develop..work"); got != "work change" {
+		t.Fatalf("refresh reapplied side-parent or merge commit: %q", got)
+	}
+	workAfter := output(t, dir, "rev-parse", "work")
+	backupBefore := output(t, dir, "for-each-ref", "--format=%(refname)", "refs/heads/kit/backup")
+	again, err := Refresh(context.Background(), gitservice.Service{Dir: dir}, gitservice.DefaultWorkflowConfig(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.SourceRebuilt || again.BackupBranch != "" || output(t, dir, "rev-parse", "work") != workAfter || output(t, dir, "for-each-ref", "--format=%(refname)", "refs/heads/kit/backup") != backupBefore {
+		t.Fatalf("repeat refresh was not a no-op: %#v", again)
+	}
+}
+
+func TestSyncRebuildsMergedSourceFromFirstParentCommits(t *testing.T) {
+	dir, _, workBefore := nonLinearSyncRepository(t)
+	result, err := Sync(context.Background(), gitservice.Service{Dir: dir}, SyncOptions{Config: gitservice.DefaultWorkflowConfig()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.SourceRebuilt || result.PendingKept != 1 || result.ExcludedMerges != 1 || result.BackupBranch == "" {
+		t.Fatalf("unexpected sync result: %#v", result)
+	}
+	if got := output(t, dir, "rev-parse", "work"); got == workBefore {
+		t.Fatal("sync did not rebuild merged work")
+	}
+	if got := output(t, dir, "log", "--format=%s", "develop..work"); got != "work change" {
+		t.Fatalf("sync reapplied side-parent or merge commit: %q", got)
+	}
+	workAfter := output(t, dir, "rev-parse", "work")
+	backupBefore := output(t, dir, "for-each-ref", "--format=%(refname)", "refs/heads/kit/backup")
+	again, err := Sync(context.Background(), gitservice.Service{Dir: dir}, SyncOptions{Config: gitservice.DefaultWorkflowConfig()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.SourceRebuilt || again.BackupBranch != "" || output(t, dir, "rev-parse", "work") != workAfter || output(t, dir, "for-each-ref", "--format=%(refname)", "refs/heads/kit/backup") != backupBefore {
+		t.Fatalf("repeat sync was not a no-op: %#v", again)
 	}
 }
 
@@ -439,6 +570,26 @@ func syncConflictRepository(t *testing.T) (string, string) {
 	run(t, dir, "push", "origin", "develop")
 	run(t, dir, "switch", "work")
 	return dir, remote
+}
+
+func nonLinearSyncRepository(t *testing.T) (dir, baseBefore, workBefore string) {
+	t.Helper()
+	dir, _ = syncRepository(t)
+
+	run(t, dir, "switch", "-c", "work")
+	writeCommit(t, dir, "work.txt", "work\n", "work change")
+	run(t, dir, "switch", "-c", "side")
+	writeCommit(t, dir, "side.txt", "side\n", "side change")
+	run(t, dir, "switch", "work")
+	run(t, dir, "merge", "--no-ff", "side", "-m", "merge side into work")
+	workBefore = output(t, dir, "rev-parse", "work")
+
+	run(t, dir, "switch", "develop")
+	writeCommit(t, dir, "team.txt", "team\n", "team change")
+	run(t, dir, "push", "origin", "develop")
+	baseBefore = output(t, dir, "rev-parse", "develop")
+	run(t, dir, "switch", "work")
+	return dir, baseBefore, workBefore
 }
 
 func syncTwoConflictRepository(t *testing.T) (string, string) {

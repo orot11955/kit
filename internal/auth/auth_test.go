@@ -269,6 +269,18 @@ func TestOnlyUnavailableKeyringErrorsEnableFallbackClassification(t *testing.T) 
 	}
 }
 
+func TestDarwinExit36IsClassifiedAsKeychainInteractionRequired(t *testing.T) {
+	backend := newMemoryBackend()
+	manager := NewManager(filepath.Join(t.TempDir(), "auth"), "darwin", backend)
+	if _, err := manager.Login("gitea", "git.example.com", "secret", StoreKeyring); err != nil {
+		t.Fatal(err)
+	}
+	backend.getErr = fakeExitError(36)
+	if _, err := manager.Lookup("gitea", "git.example.com"); !errors.Is(err, ErrKeychainInteractionRequired) {
+		t.Fatalf("darwin exit 36 was not classified: %v", err)
+	}
+}
+
 type fakeExitError int
 
 func (e fakeExitError) Error() string { return "exit status" }

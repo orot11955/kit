@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -89,5 +90,65 @@ func TestWorkflowConfigRejectsOptionLikeRemote(t *testing.T) {
 	err := (Service{Dir: dir}).ConfigSet(context.Background(), "git.remote", "--upload-pack=evil")
 	if err == nil {
 		t.Fatal("expected invalid remote error")
+	}
+}
+
+func TestKitCreatedBranchMarkerLifecycle(t *testing.T) {
+	dir := initRepository(t)
+	service := Service{Dir: dir}
+	ctx := context.Background()
+	for _, branch := range []string{"review/one", "Review.Two"} {
+		if err := service.MarkKitCreatedBranch(ctx, branch); err != nil {
+			t.Fatal(err)
+		}
+	}
+	branches, err := service.KitCreatedBranches(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(branches) != 2 || branches[0] != "Review.Two" || branches[1] != "review/one" {
+		t.Fatalf("unexpected Kit branch markers: %#v", branches)
+	}
+	if err := service.ClearKitCreatedBranch(ctx, "review/one"); err != nil {
+		t.Fatal(err)
+	}
+	if marked, err := service.IsKitCreatedBranch(ctx, "review/one"); err != nil || marked {
+		t.Fatalf("marker remained after clear: marked=%v err=%v", marked, err)
+	}
+	if err := service.ClearKitCreatedBranch(ctx, "review/one"); err != nil {
+		t.Fatalf("clearing an absent marker should be harmless: %v", err)
+	}
+}
+
+func TestKitCreatedBranchesRequireExactlyOneCanonicalTrueMarker(t *testing.T) {
+	dir := initRepository(t)
+	service := Service{Dir: dir}
+	ctx := context.Background()
+	for branch, values := range map[string][]string{
+		"review/false":     {"false"},
+		"review/arbitrary": {"yes"},
+		"review/case":      {"TRUE"},
+		"review/multiple":  {"true", "true"},
+		"review/valid":     {"true"},
+	} {
+		for _, value := range values {
+			if _, err := service.run(ctx, "config", "--local", "--add", "branch."+branch+".kitCreated", value); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	branches, err := service.KitCreatedBranches(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(branches) != 1 || branches[0] != "review/valid" {
+		t.Fatalf("unexpected trusted Kit markers: %#v", branches)
+	}
+	if err := service.ClearKitCreatedBranch(ctx, "review/false"); err != nil {
+		t.Fatal(err)
+	}
+	out, err := service.run(ctx, "config", "--local", "--get-all", "branch.review/false.kitCreated")
+	if err == nil || strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("corrupted marker remained after clear: %q, %v", out, err)
 	}
 }

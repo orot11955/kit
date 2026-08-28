@@ -23,7 +23,6 @@ type State struct {
 	Next            int      `json:"next"`
 	HeadBefore      string   `json:"head_before,omitempty"`
 	SubmitAfterPick bool     `json:"submit_after_pick,omitempty"`
-	WaitAfterSubmit bool     `json:"wait_after_submit,omitempty"`
 }
 
 func Load(ctx context.Context, service gitservice.Service) (State, error) {

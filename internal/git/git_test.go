@@ -148,11 +148,30 @@ func TestAppliedByCherryPickRecord(t *testing.T) {
 
 func initRepository(t *testing.T) string {
 	t.Helper()
-	dir := t.TempDir()
+	dir := privateTestTempDir(t)
 	gitRun(t, dir, "init", "-b", "develop")
 	gitRun(t, dir, "config", "user.name", "Kit Test")
 	gitRun(t, dir, "config", "user.email", "kit@example.invalid")
 	writeAndCommit(t, dir, "root.txt", "root\n", "root")
+	return dir
+}
+
+func initRepositoryInPrivateTemp(t *testing.T) string {
+	t.Helper()
+	return initRepository(t)
+}
+
+func privateTestTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/private/tmp", "kit-git-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("remove test directory %s: %v", dir, err)
+		}
+	})
 	return dir
 }
 

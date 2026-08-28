@@ -38,7 +38,7 @@
             <h1 id="hero-title">익숙한 Git 작업을<br /><span>더 짧고 분명하게.</span></h1>
             <p class="hero-description">
               <code>kit</code>은 반복해서 사용하던 shell 명령을 하나의 Go binary로 정리한 도구입니다.
-              커밋 반영 상태를 비교하고, 필요한 커밋만 골라 새 브랜치에 적용합니다.
+              남은 커밋을 확인하고, 필요한 변경을 골라 PR을 만든 뒤 Git queue를 동기화합니다.
             </p>
             <div class="hero-actions">
               <a class="button button-primary" href="#install">설치하기</a>
@@ -57,8 +57,9 @@
 <span class="success">✓</span>     329ab12f  2026-08-14 10:30  applied commit
 <span class="pending">●</span>     a137bc91  2026-08-14 11:20  pending commit
 
-<span class="prompt">$</span> kit pick feat/login --wait
-<span class="muted">Select · submit MR/PR · wait for merge</span></code></pre>
+<span class="prompt">$</span> kit pick feat/login
+<span class="muted">Select · push · Gitea PR · return</span>
+<span class="success">✓</span> Gitea에서 merge한 뒤 kit sync를 실행합니다.</code></pre>
           </div>
         </div>
       </section>
@@ -110,8 +111,8 @@
         <div class="shell">
           <div class="section-heading">
             <p class="section-index">02 / COMMANDS</p>
-            <h2 id="commands-title">반복 작업을 명확한 명령으로.</h2>
-            <p>Git의 동작과 기록을 그대로 유지하면서 선택과 확인 과정을 간결하게 만듭니다.</p>
+            <h2 id="commands-title">세 단계로 끝내는 일상 흐름.</h2>
+            <p>Git의 동작과 기록을 유지하면서, 확인·PR 생성·동기화의 세 단계만 연결합니다.</p>
           </div>
 
           <div class="command-list">
@@ -125,7 +126,8 @@
                 <p>
                   source의 커밋이 base에 반영됐는지 <code>cherry-pick -x</code> 기록과
                   stable patch-id로 비교합니다. 기본 source는 <code>work</code>, base는
-                  <code>develop</code>입니다.
+                  <code>develop</code>입니다. provider API나 review metadata를 조회하지 않으며,
+                  결과에서 바로 다음 <code>pick</code> 명령을 확인합니다.
                 </p>
                 <div class="code-block">
                   <code id="compare-command">kit compare work --base develop --limit 10</code>
@@ -145,7 +147,8 @@
                 </div>
                 <p>
                   최신 develop을 확인한 뒤 source의 미반영 커밋을 내장 fuzzy UI에서 선택합니다.
-                  새 브랜치에 적용하고 push와 Gitea PR 생성까지 한 번에 처리합니다.
+                  새 브랜치 적용, push와 Gitea PR Create 요청 1회를 처리한 뒤 즉시 반환합니다. PR이 Gitea에서
+                  머지된 뒤에는 <code>kit sync</code>로 local Git queue를 동기화합니다.
                 </p>
                 <div class="code-block">
                   <code id="pick-command">kit pick feat/login</code>
@@ -154,30 +157,37 @@
                   </button>
                 </div>
                 <p class="key-help"><kbd>space</kbd> 선택 · <kbd>enter</kbd> 확인 · <kbd>esc</kbd> 취소</p>
+                <p class="key-help"><code>--all</code> 미반영 커밋 전체 선택 · <code>--local</code> 로컬 branch만 생성</p>
+                <p class="key-help">PR Create가 실패하면 local/remote branch를 보존합니다. 재시도 전 Gitea에서 PR 생성 여부를 수동 확인하세요.</p>
+                <p class="key-help">macOS login Keychain이 잠긴 일반 TTY에서는 표준 <code>security unlock-keychain</code> prompt를 한 번 열고 token 조회를 한 번 재시도합니다. JSON·CI·pipe에서는 먼저 대화형 terminal에서 <code>security unlock-keychain "$HOME/Library/Keychains/login.keychain-db"</code>로 Keychain을 수동 해제해야 합니다.</p>
               </div>
             </article>
 
             <article class="command-card compact-command">
               <div class="command-number" aria-hidden="true">03</div>
               <div class="command-content">
-                <div class="command-title-row"><h3><code>kit status</code></h3></div>
-                <p>main, develop, work와 진행 중인 Gitea PR 상태를 한 화면에서 확인합니다. 서버가 느리면 <code>--cached</code>로 즉시 확인할 수 있습니다.</p>
+                <div class="command-title-row"><h3><code>kit sync</code></h3></div>
+                <p>Gitea에서 PR을 merge한 뒤 <code>kit sync</code>는 Git만 사용해 최신 base와 local work queue를 동기화하고, 향후 Kit-created marker가 기록된 review branch를 안전하게 정리합니다. provider API나 PR head는 확인하지 않습니다.</p>
+                <p class="key-help">최신 <code>develop</code>에서 <code>work</code>를 재구성하고, direct first-parent 일반 pending commit만 다시 적용합니다. merge commit과 side-parent commit은 제외되며 실행 전에 경고합니다.</p>
+                <p class="key-help">현재 base의 ancestor인 Kit-marked local branch만 non-force로 삭제합니다. squash merge·non-ancestor·unmarked·보호 branch와 remote branch는 보존하며, cleanup 실패는 warning으로 남고 sync는 성공합니다. 현재 branch는 정확히 <code>origin/&lt;branch&gt;</code> upstream을 추적할 때만 <code>work</code>로 전환해 정리합니다.</p>
+                <p class="key-help">성공 뒤에도 원본 <code>work</code> backup branch가 남아 복원할 수 있습니다. side 작업은 <code>work</code>에 merge하지 말고 direct commit으로 남기거나 별도 review branch에서 관리하세요.</p>
               </div>
             </article>
 
             <article class="command-card compact-command">
               <div class="command-number" aria-hidden="true">04</div>
               <div class="command-content">
-                <div class="command-title-row"><h3><code>kit sync</code></h3></div>
-                <p>merge를 확인하고 develop/work 갱신과 로컬 review 브랜치 정리를 처리합니다.</p>
+                <div class="command-title-row"><h3><code>kit status</code> · <code>kit review</code></h3></div>
+                <p>cached legacy review metadata를 확인하는 고급 명령입니다. metadata는 읽기 전용으로 남고 자동 삭제되지 않습니다.</p>
+                <p class="key-help">squash merge는 <code>cherry-pick -x</code>와 patch-id 비교만으로 반영 여부를 확정할 수 없습니다. pending 표시가 남으면 Gitea와 Git history를 수동 확인하세요.</p>
               </div>
             </article>
 
             <article class="command-card compact-command">
               <div class="command-number" aria-hidden="true">05</div>
               <div class="command-content">
-                <div class="command-title-row"><h3><code>kit review</code></h3></div>
-                <p>여러 review의 조회, 대기 또는 개별 복구가 필요할 때 사용하는 고급 명령입니다.</p>
+                <div class="command-title-row"><h3><code>kit backup</code></h3></div>
+                <p>work 재구성 전 생성된 원본 backup을 조회·복원·정리합니다. 성공한 sync 뒤에도 backup은 복구를 위해 남습니다.</p>
               </div>
             </article>
 
@@ -213,10 +223,11 @@
               <div class="change-notes">
                 <h3>변경 내용</h3>
                 <ul id="release-notes">
-                  <li><code>kit compare</code>로 커밋 반영 상태를 비교합니다.</li>
-                  <li><code>kit pick</code>의 내장 fuzzy UI에서 적용할 커밋을 선택합니다.</li>
-                  <li><code>kit sync</code>가 merge 확인, 협업 변경 반영과 work 재구성을 처리합니다.</li>
-                  <li><code>kit review</code>는 review 대기와 개별 복구가 필요할 때 사용합니다.</li>
+                  <li><code>kit compare</code>로 남은 work 커밋을 확인하고 다음 <code>pick</code> 명령을 안내합니다.</li>
+                  <li><code>kit pick</code>은 내장 fuzzy UI 선택부터 push와 Gitea PR 생성까지 처리하고 즉시 반환합니다.</li>
+                  <li><code>--all</code>은 대량 refactor에서 미반영 commit 전체를 선택합니다. PR Create 실패 시 Gitea를 수동 확인하세요.</li>
+                  <li>PR을 Gitea에서 merge한 뒤 <code>kit sync</code>가 Git만 사용해 local queue를 동기화합니다.</li>
+                  <li><code>status</code>와 <code>review</code>의 legacy metadata는 읽기 전용입니다.</li>
                   <li><code>kit update</code>가 checksum 검증 후 binary를 갱신합니다.</li>
                 </ul>
               </div>

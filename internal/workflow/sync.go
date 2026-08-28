@@ -12,11 +12,10 @@ import (
 )
 
 type SyncOptions struct {
-	Config               gitservice.WorkflowConfig
-	DryRun               bool
-	BaseOnly             bool
-	Resolver             SyncConflictResolver
-	TrustedAppliedHashes map[string]struct{}
+	Config   gitservice.WorkflowConfig
+	DryRun   bool
+	BaseOnly bool
+	Resolver SyncConflictResolver
 }
 
 type SyncConflictAction string
@@ -39,19 +38,22 @@ type SyncConflict struct {
 }
 
 type SyncResult struct {
-	Remote         string `json:"remote"`
-	Base           string `json:"base"`
-	Source         string `json:"source"`
-	BaseBefore     string `json:"base_before"`
-	BaseAfter      string `json:"base_after"`
-	BaseUpdated    bool   `json:"base_updated"`
-	SourceStale    bool   `json:"source_stale"`
-	SourceRebuilt  bool   `json:"source_rebuilt"`
-	AppliedDropped int    `json:"applied_dropped"`
-	PendingKept    int    `json:"pending_kept"`
-	Skipped        int    `json:"skipped"`
-	BackupBranch   string `json:"backup_branch,omitempty"`
-	DryRun         bool   `json:"dry_run"`
+	Remote          string   `json:"remote"`
+	Base            string   `json:"base"`
+	Source          string   `json:"source"`
+	BaseBefore      string   `json:"base_before"`
+	BaseAfter       string   `json:"base_after"`
+	BaseUpdated     bool     `json:"base_updated"`
+	SourceStale     bool     `json:"source_stale"`
+	SourceRebuilt   bool     `json:"source_rebuilt"`
+	AppliedDropped  int      `json:"applied_dropped"`
+	PendingKept     int      `json:"pending_kept"`
+	ExcludedMerges  int      `json:"excluded_merge_commits"`
+	Skipped         int      `json:"skipped"`
+	BackupBranch    string   `json:"backup_branch,omitempty"`
+	CleanedBranches []string `json:"cleaned_branches,omitempty"`
+	CleanupWarnings []string `json:"cleanup_warnings,omitempty"`
+	DryRun          bool     `json:"dry_run"`
 }
 
 func Refresh(ctx context.Context, service gitservice.Service, config gitservice.WorkflowConfig, dryRun bool) (SyncResult, error) {
@@ -79,6 +81,10 @@ func Refresh(ctx context.Context, service gitservice.Service, config gitservice.
 		return result, err
 	}
 	result.SourceStale = !synced
+	result.ExcludedMerges, err = service.MergeCount(ctx, config.Base, config.Source)
+	if err != nil {
+		return result, fmt.Errorf("count excluded source merges: %w", err)
+	}
 	commits, err := service.Candidates(ctx, config.Base, config.Source, true)
 	if err != nil {
 		return result, fmt.Errorf("list source commits: %w", err)
@@ -96,7 +102,7 @@ func Refresh(ctx context.Context, service gitservice.Service, config gitservice.
 			pending = append(pending, commit)
 		}
 	}
-	if dryRun || (synced && result.AppliedDropped == 0) {
+	if dryRun || !result.rebuildNeeded() {
 		return result, nil
 	}
 	originalHash, originalBranch, err := service.Head(ctx)
@@ -158,12 +164,16 @@ func Sync(ctx context.Context, service gitservice.Service, opts SyncOptions) (Sy
 	result.BaseUpdated = behind > 0
 
 	if !opts.BaseOnly {
-		synced, err := service.IsAncestor(ctx, config.Base, config.Source)
+		result.ExcludedMerges, err = service.MergeCount(ctx, remoteBase, config.Source)
+		if err != nil {
+			return result, fmt.Errorf("count excluded work merges: %w", err)
+		}
+		synced, err := service.IsAncestor(ctx, remoteBase, config.Source)
 		if err != nil {
 			return result, fmt.Errorf("check whether %s contains %s: %w", config.Source, config.Base, err)
 		}
-		result.SourceStale = !synced || behind > 0
-		commits, err := service.Candidates(ctx, config.Base, config.Source, true)
+		result.SourceStale = !synced
+		commits, err := service.Candidates(ctx, remoteBase, config.Source, true)
 		if err != nil {
 			return result, fmt.Errorf("list work commits: %w", err)
 		}
@@ -171,7 +181,6 @@ func Sync(ctx context.Context, service gitservice.Service, opts SyncOptions) (Sy
 		if err != nil {
 			return result, fmt.Errorf("classify work commits: %w", err)
 		}
-		commits = markTrustedApplied(commits, opts.TrustedAppliedHashes)
 		for _, commit := range commits {
 			if commit.Applied {
 				result.AppliedDropped++
@@ -207,12 +216,7 @@ func Sync(ctx context.Context, service gitservice.Service, opts SyncOptions) (Sy
 	if opts.BaseOnly {
 		return result, nil
 	}
-
-	synced, err := service.IsAncestor(ctx, config.Base, config.Source)
-	if err != nil {
-		return result, rollbackUpdatedBase(err)
-	}
-	if synced && result.AppliedDropped == 0 {
+	if !result.rebuildNeeded() {
 		return result, nil
 	}
 
@@ -224,7 +228,6 @@ func Sync(ctx context.Context, service gitservice.Service, opts SyncOptions) (Sy
 	if err != nil {
 		return result, rollbackUpdatedBase(fmt.Errorf("classify source commits after base update: %w", err))
 	}
-	commits = markTrustedApplied(commits, opts.TrustedAppliedHashes)
 	pending := make([]gitservice.Commit, 0, len(commits))
 	result.AppliedDropped = 0
 	result.PendingKept = 0
@@ -247,16 +250,8 @@ func Sync(ctx context.Context, service gitservice.Service, opts SyncOptions) (Sy
 	return result, nil
 }
 
-func markTrustedApplied(commits []gitservice.Commit, trusted map[string]struct{}) []gitservice.Commit {
-	if len(trusted) == 0 {
-		return commits
-	}
-	for i := range commits {
-		if _, ok := trusted[strings.ToLower(commits[i].Hash)]; ok {
-			commits[i].Applied = true
-		}
-	}
-	return commits
+func (r SyncResult) rebuildNeeded() bool {
+	return r.SourceStale || r.AppliedDropped > 0 || r.ExcludedMerges > 0
 }
 
 func updateBase(ctx context.Context, service gitservice.Service, base, remoteBase, baseBefore, originalHash, originalBranch string) error {

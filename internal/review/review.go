@@ -49,10 +49,7 @@ type Review struct {
 }
 
 type Client interface {
-	FindOpen(ctx context.Context, sourceBranch, targetBranch string) ([]Review, error)
-	Find(ctx context.Context, sourceBranch, targetBranch string) ([]Review, error)
 	Create(ctx context.Context, request CreateRequest) (Review, error)
-	Get(ctx context.Context, id string) (Review, error)
 }
 
 type Options struct {

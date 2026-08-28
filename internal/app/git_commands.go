@@ -16,7 +16,6 @@ import (
 	gitservice "kit/internal/git"
 	"kit/internal/hosting"
 	"kit/internal/pickstate"
-	"kit/internal/review"
 	"kit/internal/reviewstate"
 	"kit/internal/ui"
 	"kit/internal/workflow"
@@ -40,24 +39,15 @@ type gitStatusResult struct {
 	ReviewWarnings []string                  `json:"review_warnings,omitempty"`
 }
 
-const statusReviewRefreshTimeout = 5 * time.Second
-
-func (a *Application) statusRefreshTimeout() time.Duration {
-	if a.statusReviewRefreshTimeout > 0 {
-		return a.statusReviewRefreshTimeout
-	}
-	return statusReviewRefreshTimeout
-}
-
 func (a *Application) gitStatus(ctx context.Context, global globalOptions, args []string) error {
-	return a.gitStatusWithReviews(ctx, global, args, false)
+	return a.gitStatusWithReviews(ctx, global, args)
 }
 
 func (a *Application) statusCommand(ctx context.Context, global globalOptions, args []string) error {
-	return a.gitStatusWithReviews(ctx, global, args, true)
+	return a.gitStatusWithReviews(ctx, global, args)
 }
 
-func (a *Application) gitStatusWithReviews(ctx context.Context, global globalOptions, args []string, refreshReviews bool) error {
+func (a *Application) gitStatusWithReviews(ctx context.Context, global globalOptions, args []string) error {
 	fetch := false
 	for len(args) > 0 {
 		if args[0] == "-h" || args[0] == "--help" {
@@ -75,7 +65,7 @@ func (a *Application) gitStatusWithReviews(ctx context.Context, global globalOpt
 			continue
 		}
 		if args[0] == "--cached" {
-			refreshReviews, args = false, args[1:]
+			args = args[1:]
 			continue
 		}
 		return clierror.New(clierror.Usage, "unknown git status option %q", args[0])
@@ -127,22 +117,8 @@ func (a *Application) gitStatusWithReviews(ctx context.Context, global globalOpt
 	if err != nil {
 		return clierror.Wrap(clierror.Failure, err, "list tracked reviews")
 	}
-	reviewCtx := withInsecureHTTPWarningOnce(ctx)
-	if refreshReviews {
-		var cancel context.CancelFunc
-		reviewCtx, cancel = context.WithTimeout(reviewCtx, a.statusRefreshTimeout())
-		defer cancel()
-	}
 	for _, state := range states {
 		if state.Stage != reviewstate.StageCleaned {
-			if refreshReviews && state.Stage != reviewstate.StagePicked && state.Stage != reviewstate.StageClosed {
-				refreshed, _, refreshErr := a.refreshReview(reviewCtx, service, state.Branch)
-				if refreshErr != nil {
-					result.ReviewWarnings = append(result.ReviewWarnings, fmt.Sprintf("%s: %v", state.Branch, refreshErr))
-				} else {
-					state = refreshed
-				}
-			}
 			result.Reviews = append(result.Reviews, state)
 		}
 	}
@@ -286,32 +262,6 @@ func (a *Application) syncCommand(ctx context.Context, global globalOptions, arg
 	if global.json && !global.yes && !opts.dryRun {
 		return clierror.New(clierror.Usage, "sync --json requires --yes or --dry-run")
 	}
-	if opts.dryRun && !opts.baseOnly {
-		service, err := a.validatedGit(ctx, global.cwd)
-		if err != nil {
-			return err
-		}
-		handled, err := a.previewMergedReviewBeforeSync(ctx, global, service)
-		if err != nil {
-			return err
-		}
-		if handled {
-			return nil
-		}
-	}
-	if !opts.dryRun && !opts.baseOnly {
-		service, err := a.validatedGit(ctx, global.cwd)
-		if err != nil {
-			return err
-		}
-		handled, err := a.finishMergedReviewBeforeSync(ctx, global, service)
-		if err != nil {
-			return err
-		}
-		if handled {
-			return nil
-		}
-	}
 	return a.gitSyncWithOptions(ctx, global, opts)
 }
 
@@ -364,6 +314,9 @@ func (a *Application) gitSyncWithOptions(ctx context.Context, global globalOptio
 		return nil
 	}
 	reader := bufio.NewReader(a.IO.In)
+	if global.yes {
+		printExcludedMergeWarning(a.IO.ErrOut, plan)
+	}
 	if !global.yes {
 		printSyncResult(a.renderer(global), plan)
 		ok, err := confirmReaderContext(ctx, reader, a.IO.Out, "이 계획으로 동기화하시겠습니까? [y/N] ")
@@ -390,6 +343,9 @@ func (a *Application) gitSyncWithOptions(ctx context.Context, global globalOptio
 	if commandErr := syncCommandError(mutationCtx, err); commandErr != nil {
 		return commandErr
 	}
+	if !opts.baseOnly {
+		result.CleanedBranches, result.CleanupWarnings = cleanupSyncedKitBranches(mutationCtx, service, config)
+	}
 	if global.json {
 		return writeJSON(a.IO.Out, result)
 	}
@@ -397,140 +353,91 @@ func (a *Application) gitSyncWithOptions(ctx context.Context, global globalOptio
 	return nil
 }
 
-func (a *Application) finishMergedReviewBeforeSync(ctx context.Context, global globalOptions, service gitservice.Service) (bool, error) {
-	states, err := reviewstate.List(ctx, service)
+// cleanupSyncedKitBranches removes only Kit-marked review branches whose tips
+// Git proves were incorporated into base. It intentionally keeps remotes and
+// uses Git's non-force deletion as a final safety check.
+func cleanupSyncedKitBranches(ctx context.Context, service gitservice.Service, config gitservice.WorkflowConfig) ([]string, []string) {
+	branches, err := service.KitCreatedBranches(ctx)
 	if err != nil {
-		return false, clierror.Wrap(clierror.Failure, err, "list tracked reviews before sync")
+		return nil, []string{fmt.Sprintf("could not list Kit-created branches: %v", err)}
 	}
-	ctx = withInsecureHTTPWarningOnce(ctx)
-	type mergedReview struct {
-		state  reviewstate.State
-		remote review.Review
+	_, current, err := service.Head(ctx)
+	if err != nil {
+		return nil, []string{fmt.Sprintf("could not read current branch for cleanup: %v", err)}
 	}
-	merged := make([]mergedReview, 0, 1)
-	for _, state := range states {
-		switch state.Stage {
-		case reviewstate.StagePicked, reviewstate.StageClosed, reviewstate.StageCleaned:
+	var cleaned, warnings []string
+	for _, branch := range branches {
+		if branch == config.Stable || branch == config.Base || branch == config.Source {
 			continue
 		}
-		refreshed, remote, refreshErr := a.refreshReview(ctx, service, state.Branch)
-		if refreshErr != nil {
-			return false, clierror.Wrap(clierror.Code(refreshErr), refreshErr, "refresh review %s before sync; use --base-only only to intentionally skip review cleanup", state.Branch)
+		exists, err := service.LocalBranchExists(ctx, branch)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("kept %s: could not inspect local branch: %v", branch, err))
+			continue
 		}
-		if remote.Status == review.StatusMerged {
-			merged = append(merged, mergedReview{state: refreshed, remote: remote})
+		if !exists {
+			if err := service.ClearKitCreatedBranch(ctx, branch); err != nil {
+				warnings = append(warnings, fmt.Sprintf("could not clear stale marker for %s: %v", branch, err))
+			}
+			continue
 		}
-	}
-	if len(merged) == 0 {
-		return false, nil
-	}
-	if len(merged) > 1 {
-		branches := make([]string, 0, len(merged))
-		for _, item := range merged {
-			branches = append(branches, item.state.Branch)
+		merged, err := service.IsAncestor(ctx, branch, config.Base)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("kept %s: could not verify ancestry to %s: %v", branch, config.Base, err))
+			continue
 		}
-		return false, clierror.New(clierror.Conflict, "multiple merged reviews require an explicit choice: %s; run 'kit review finish <branch>'", strings.Join(branches, ", "))
+		if !merged {
+			continue
+		}
+		checkedTip, err := service.RevisionHash(ctx, branch)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("kept %s: could not record branch tip before cleanup: %v", branch, err))
+			continue
+		}
+		if branch == current {
+			upstream, err := service.UpstreamForBranch(ctx, branch)
+			expected := config.Remote + "/" + branch
+			if err != nil {
+				warnings = append(warnings, fmt.Sprintf("kept current branch %s: could not read upstream: %v", branch, err))
+				continue
+			}
+			if upstream != expected {
+				warnings = append(warnings, fmt.Sprintf("kept current branch %s: upstream %q does not match %q", branch, upstream, expected))
+				continue
+			}
+			if err := service.Switch(ctx, config.Source); err != nil {
+				warnings = append(warnings, fmt.Sprintf("kept current branch %s: could not switch to %s: %v", branch, config.Source, err))
+				continue
+			}
+			current = config.Source
+		}
+		currentTip, err := service.RevisionHash(ctx, branch)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("kept %s: could not recheck branch tip before cleanup: %v", branch, err))
+			continue
+		}
+		if currentTip != checkedTip {
+			warnings = append(warnings, fmt.Sprintf("kept %s: branch tip changed during cleanup", branch))
+			continue
+		}
+		if err := service.DeleteBranch(ctx, branch, false); err != nil {
+			warnings = append(warnings, fmt.Sprintf("kept %s: safe local branch deletion failed: %v", branch, err))
+			continue
+		}
+		if err := service.ClearKitCreatedBranch(ctx, branch); err != nil {
+			warnings = append(warnings, fmt.Sprintf("removed %s but could not clear its marker: %v", branch, err))
+			continue
+		}
+		cleaned = append(cleaned, branch)
 	}
-	item := merged[0]
-	err = a.reviewFinishResolvedWithService(ctx, global, reviewFinishOptions{
-		branch: item.state.Branch, displayName: "sync",
-	}, service, item.state, item.remote)
-	return true, err
+	return cleaned, warnings
 }
 
-func (a *Application) previewMergedReviewBeforeSync(ctx context.Context, global globalOptions, service gitservice.Service) (bool, error) {
-	states, err := reviewstate.List(ctx, service)
-	if err != nil {
-		return false, clierror.Wrap(clierror.Failure, err, "list tracked reviews before sync preview")
+func printExcludedMergeWarning(w io.Writer, result workflow.SyncResult) {
+	if result.ExcludedMerges == 0 {
+		return
 	}
-	ctx = withInsecureHTTPWarningOnce(ctx)
-	type mergedReview struct {
-		state  reviewstate.State
-		remote review.Review
-	}
-	merged := make([]mergedReview, 0, 1)
-	for _, state := range states {
-		switch state.Stage {
-		case reviewstate.StagePicked, reviewstate.StageClosed, reviewstate.StageCleaned:
-			continue
-		}
-		inspected, remote, inspectErr := a.inspectReview(ctx, service, state.Branch)
-		if inspectErr != nil {
-			return false, clierror.Wrap(clierror.Code(inspectErr), inspectErr, "inspect review %s before sync preview; use --base-only only to intentionally skip review cleanup", state.Branch)
-		}
-		if remote.Status == review.StatusMerged {
-			merged = append(merged, mergedReview{state: inspected, remote: remote})
-		}
-	}
-	if len(merged) == 0 {
-		return false, nil
-	}
-	if len(merged) > 1 {
-		branches := make([]string, 0, len(merged))
-		for _, item := range merged {
-			branches = append(branches, item.state.Branch)
-		}
-		return false, clierror.New(clierror.Conflict, "multiple merged reviews require an explicit choice: %s; run 'kit review finish <branch>'", strings.Join(branches, ", "))
-	}
-	item := merged[0]
-	if item.remote.SourceSHA == "" || item.remote.SourceSHA != item.state.PublishedTip {
-		return false, clierror.New(clierror.Conflict, "provider review head differs from the submitted commit; refusing sync preview")
-	}
-	if item.remote.MergeSHA == "" {
-		return false, clierror.New(clierror.Conflict, "provider did not report a merge commit; refusing sync preview")
-	}
-	config := service.WorkflowConfig(ctx)
-	var plan *workflow.SyncResult
-	if item.state.Stage != reviewstate.StageSynced {
-		trusted := make(map[string]struct{}, len(item.state.SourceCommits))
-		for _, hash := range item.state.SourceCommits {
-			trusted[strings.ToLower(hash)] = struct{}{}
-		}
-		planned, planErr := workflow.Sync(ctx, service, workflow.SyncOptions{
-			Config: config, DryRun: true, TrustedAppliedHashes: trusted,
-		})
-		if planErr != nil {
-			return false, clierror.Wrap(clierror.Conflict, planErr, "plan merged review sync")
-		}
-		plan = &planned
-	} else if err := service.Fetch(ctx, config.Remote); err != nil {
-		return false, clierror.Wrap(clierror.Failure, err, "fetch before sync preview")
-	}
-	remoteBase := config.Remote + "/" + config.Base
-	mergeObserved, err := service.IsAncestor(ctx, item.remote.MergeSHA, remoteBase)
-	if err != nil {
-		return false, clierror.Wrap(clierror.Failure, err, "verify merged review during sync preview")
-	}
-	if !mergeObserved {
-		return false, clierror.New(clierror.Conflict, "provider reports the review merged, but %s does not contain merge commit %s yet", remoteBase, item.remote.MergeSHA)
-	}
-	if exists, existsErr := service.LocalBranchExists(ctx, item.state.Branch); existsErr != nil {
-		return false, clierror.Wrap(clierror.Failure, existsErr, "check review branch during sync preview")
-	} else if exists {
-		localTip, tipErr := service.RevisionHash(ctx, item.state.Branch)
-		if tipErr != nil {
-			return false, clierror.Wrap(clierror.Failure, tipErr, "read review branch during sync preview")
-		}
-		if localTip != item.state.PublishedTip {
-			return false, clierror.New(clierror.Conflict, "local review branch changed after submit; refusing sync preview")
-		}
-	}
-	result := reviewResult{
-		State: item.state, Sync: plan,
-		Warnings: []string{"dry-run: work 동기화 후 local review branch를 정리할 예정입니다."},
-	}
-	if global.json {
-		return true, writeJSON(a.IO.Out, result)
-	}
-	if plan != nil {
-		printSyncResult(a.renderer(global), *plan)
-	} else {
-		a.renderer(global).Command("sync")
-	}
-	renderer := a.renderer(global)
-	renderer.Success("Review", fmt.Sprintf("%s → %s · 머지 확인", item.state.Branch, item.state.TargetBranch))
-	renderer.Pending("Cleanup", item.state.Branch+" · local branch 정리 예정")
-	return true, nil
+	fmt.Fprintf(w, "warning: work merge %d개와 side-parent 경로는 재적용되지 않으며, 원본 work는 자동 backup으로 보존됩니다\n", result.ExcludedMerges)
 }
 
 func syncCommandError(ctx context.Context, err error) error {
@@ -554,6 +461,14 @@ func printSyncResult(renderer ui.Renderer, result workflow.SyncResult) {
 	renderer.Command("sync")
 	renderer.Success("Base", fmt.Sprintf("%s · %s", result.Base, action))
 	renderer.Success("Work", fmt.Sprintf("머지된 작업 %d 제거 · 작업 %d 유지", result.AppliedDropped, result.PendingKept))
+	if result.ExcludedMerges > 0 {
+		renderer.Warning("Excluded", fmt.Sprintf("work merge %d개와 side-parent 경로는 재적용되지 않습니다", result.ExcludedMerges))
+		if result.DryRun {
+			renderer.Warning("Backup", "실행 시 원본 work는 자동 backup으로 보존됩니다")
+		} else if result.BackupBranch != "" {
+			renderer.Warning("Backup", "원본 work는 자동 backup에 보존됩니다")
+		}
+	}
 	if result.Skipped > 0 {
 		renderer.Warning("Skipped", fmt.Sprintf("%d개 커밋", result.Skipped))
 	}
@@ -562,6 +477,12 @@ func printSyncResult(renderer ui.Renderer, result workflow.SyncResult) {
 	}
 	if result.BackupBranch != "" {
 		renderer.Field("Backup", result.BackupBranch)
+	}
+	for _, branch := range result.CleanedBranches {
+		renderer.Success("Cleanup", "로컬 브랜치 "+branch+" 제거")
+	}
+	for _, warning := range result.CleanupWarnings {
+		renderer.Warning("Cleanup", warning)
 	}
 }
 
@@ -815,6 +736,9 @@ Commands:
 				fmt.Fprintln(a.IO.Out, "취소되었습니다.")
 				return nil
 			}
+		}
+		if global.yes {
+			printExcludedMergeWarning(a.IO.ErrOut, plan)
 		}
 		result, err := workflow.Refresh(ctx, service, config, false)
 		if err != nil {

@@ -117,25 +117,3 @@ func validateCreateRequest(request CreateRequest) error {
 	}
 	return nil
 }
-
-func validateFindRequest(sourceBranch, targetBranch string) error {
-	if sourceBranch == "" || targetBranch == "" {
-		return errors.New("source branch and target branch are required")
-	}
-	return nil
-}
-
-func positiveID(id string) (string, error) {
-	if id == "" {
-		return "", errors.New("review ID is required")
-	}
-	for _, character := range id {
-		if character < '0' || character > '9' {
-			return "", errors.New("review ID must be a positive integer")
-		}
-	}
-	if strings.TrimLeft(id, "0") == "" {
-		return "", errors.New("review ID must be a positive integer")
-	}
-	return id, nil
-}

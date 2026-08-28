@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -22,7 +23,6 @@ import (
 	"kit/internal/hosting"
 	"kit/internal/pickstate"
 	"kit/internal/review"
-	"kit/internal/reviewstate"
 	"kit/internal/selector"
 	"kit/internal/ui"
 	"kit/internal/update"
@@ -45,9 +45,13 @@ type Application struct {
 	Auth                       AuthService
 	AuthInit                   func() (AuthService, error)
 	ReadSecret                 func(prompt string) (string, error)
+	UnlockKeychain             func(*os.File) error
+	IsKeychainTTY              func(*os.File) bool
+	KeychainSupported          func() bool
 	Build                      buildinfo.Info
 	ExecPath                   string
 	statusReviewRefreshTimeout time.Duration
+	allowKeychainUnlock        bool
 }
 
 func New(input *os.File, output, errOutput *os.File) *Application {
@@ -63,6 +67,9 @@ func New(input *os.File, output, errOutput *os.File) *Application {
 		Build:    buildinfo.Current(),
 	}
 	application.ReadSecret = terminalSecretReader(input, errOutput)
+	application.UnlockKeychain = unlockDarwinLoginKeychain
+	application.IsKeychainTTY = isKeychainTerminal
+	application.KeychainSupported = func() bool { return runtime.GOOS == "darwin" }
 	application.ReviewClient = application.newReviewClient
 	return application
 }
@@ -96,6 +103,15 @@ func (a *Application) Run(ctx context.Context, args []string) error {
 	if a.ReadSecret == nil {
 		a.ReadSecret = terminalSecretReader(a.IO.InFile, a.IO.ErrOut)
 	}
+	if a.UnlockKeychain == nil {
+		a.UnlockKeychain = unlockDarwinLoginKeychain
+	}
+	if a.IsKeychainTTY == nil {
+		a.IsKeychainTTY = isKeychainTerminal
+	}
+	if a.KeychainSupported == nil {
+		a.KeychainSupported = func() bool { return runtime.GOOS == "darwin" }
+	}
 	if a.ReviewClient == nil {
 		a.ReviewClient = a.newReviewClient
 	}
@@ -107,6 +123,9 @@ func (a *Application) Run(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	previousKeychainUnlock := a.allowKeychainUnlock
+	a.allowKeychainUnlock = !global.json && !argumentsContainJSON(rest)
+	defer func() { a.allowKeychainUnlock = previousKeychainUnlock }()
 	switch command {
 	case "", "help":
 		printRootHelp(a.IO.Out)
@@ -140,6 +159,15 @@ func (a *Application) Run(ctx context.Context, args []string) error {
 	default:
 		return clierror.New(clierror.Usage, "unknown command %q\nRun 'kit help' for usage.", command)
 	}
+}
+
+func argumentsContainJSON(args []string) bool {
+	for _, arg := range args {
+		if arg == "--json" {
+			return true
+		}
+	}
+	return false
 }
 
 func parseRoot(args []string) (globalOptions, string, []string, error) {
@@ -273,11 +301,13 @@ func positiveInt(value string) (int, error) {
 }
 
 type compareResult struct {
-	Source  string              `json:"source"`
-	Base    string              `json:"base"`
-	Commits []gitservice.Commit `json:"commits"`
-	Applied int                 `json:"applied"`
-	Pending int                 `json:"pending"`
+	Source         string              `json:"source"`
+	Base           string              `json:"base"`
+	Commits        []gitservice.Commit `json:"commits"`
+	Applied        int                 `json:"applied"`
+	Pending        int                 `json:"pending"`
+	Available      int                 `json:"available"`
+	ExcludedMerges int                 `json:"excluded_merge_commits"`
 }
 
 func (a *Application) compare(ctx context.Context, global globalOptions, args []string) error {
@@ -308,6 +338,10 @@ func (a *Application) compare(ctx context.Context, global globalOptions, args []
 	if err := verifyRevisions(ctx, service, opts.base, opts.source); err != nil {
 		return err
 	}
+	excludedMerges, err := service.MergeCount(ctx, opts.base, opts.source)
+	if err != nil {
+		return clierror.Wrap(clierror.Failure, err, "count excluded source merges")
+	}
 	commits, err := service.Candidates(ctx, opts.base, opts.source, false)
 	if err != nil {
 		return clierror.Wrap(clierror.Failure, err, "list commits from %s", opts.source)
@@ -319,12 +353,13 @@ func (a *Application) compare(ctx context.Context, global globalOptions, args []
 	if err != nil {
 		return clierror.Wrap(clierror.Failure, err, "compare patches against %s", opts.base)
 	}
-	result := compareResult{Source: opts.source, Base: opts.base, Commits: commits}
+	result := compareResult{Source: opts.source, Base: opts.base, Commits: commits, ExcludedMerges: excludedMerges}
 	for _, commit := range commits {
 		if commit.Applied {
 			result.Applied++
 		} else {
 			result.Pending++
+			result.Available++
 		}
 	}
 	if opts.json {
@@ -370,6 +405,7 @@ func (a *Application) printCompare(result compareResult, color bool) {
 	}
 	renderer := ui.Renderer{Writer: a.IO.Out, Color: color}
 	renderer.Command("compare")
+	renderer.Section("남은 작업")
 	renderer.Field("Flow", fmt.Sprintf("%s → %s", result.Source, result.Base))
 	fmt.Fprintln(a.IO.Out)
 	fmt.Fprintf(a.IO.Out, "%s%-4s %-10s %-16s %s%s\n", bold, "STAT", "HASH", "DATE", "MESSAGE", reset)
@@ -382,8 +418,15 @@ func (a *Application) printCompare(result compareResult, color bool) {
 	}
 	fmt.Fprintln(a.IO.Out)
 	renderer.Success("Applied", fmt.Sprintf("%d개", result.Applied))
+	if result.ExcludedMerges > 0 {
+		renderer.Warning("Excluded", fmt.Sprintf("work merge %d개와 side-parent 경로는 first-parent 후보에 포함되지 않습니다", result.ExcludedMerges))
+	}
 	if result.Pending > 0 {
 		renderer.Pending("Pending", fmt.Sprintf("%d개", result.Pending))
+		renderer.Field("Available", fmt.Sprintf("%d개", result.Available))
+		if result.Available > 0 {
+			renderer.Next("kit pick <new-branch>")
+		}
 	} else {
 		renderer.Success("Pending", "없음")
 	}
@@ -391,17 +434,18 @@ func (a *Application) printCompare(result compareResult, color bool) {
 
 type pickOptions struct {
 	globalOptions
-	target     string
-	source     string
-	base       string
-	sourceSet  bool
-	baseSet    bool
-	fetch      bool
-	allowStale bool
-	submit     bool
-	localOnly  bool
-	wait       bool
-	action     string
+	target         string
+	source         string
+	base           string
+	sourceSet      bool
+	baseSet        bool
+	fetch          bool
+	allowStale     bool
+	all            bool
+	excludedMerges int
+	submit         bool
+	localOnly      bool
+	action         string
 }
 
 func parsePick(global globalOptions, args []string) (pickOptions, bool, error) {
@@ -437,12 +481,15 @@ func parsePick(global globalOptions, args []string) (pickOptions, bool, error) {
 			opts.fetch, args = true, args[1:]
 		case arg == "--allow-stale":
 			opts.allowStale, args = true, args[1:]
+		case arg == "--all":
+			opts.all, args = true, args[1:]
 		case arg == "--submit":
 			opts.submit, args = true, args[1:]
 		case arg == "--local":
 			opts.localOnly, args = true, args[1:]
-		case arg == "--wait":
-			opts.submit, opts.wait, args = true, true, args[1:]
+		case arg == "--wait" || arg == "--no-wait":
+			// Accepted for one release; Create always returns immediately.
+			opts.submit, args = true, args[1:]
 		case arg == "--continue" || arg == "--skip" || arg == "--abort":
 			if opts.action != "" {
 				return opts, false, clierror.New(clierror.Usage, "pick accepts only one resume action")
@@ -457,11 +504,14 @@ func parsePick(global globalOptions, args []string) (pickOptions, bool, error) {
 	if opts.action != "" && len(positionals) != 0 {
 		return opts, false, clierror.New(clierror.Usage, "pick resume actions do not accept a new branch name")
 	}
-	if opts.action != "" && (opts.submit || opts.localOnly || opts.wait) {
+	if opts.action != "" && (opts.submit || opts.localOnly) {
 		return opts, false, clierror.New(clierror.Usage, "pick resume actions use the submit settings saved by the original pick")
 	}
-	if opts.localOnly && (opts.submit || opts.wait) {
-		return opts, false, clierror.New(clierror.Usage, "--local cannot be combined with --submit or --wait")
+	if opts.action != "" && opts.all {
+		return opts, false, clierror.New(clierror.Usage, "pick resume actions use the commit selection saved by the original pick")
+	}
+	if opts.localOnly && opts.submit {
+		return opts, false, clierror.New(clierror.Usage, "--local cannot be combined with --submit, --wait, or --no-wait")
 	}
 	if opts.action == "" && len(positionals) != 1 {
 		return opts, false, clierror.New(clierror.Usage, "pick requires exactly one new branch name")
@@ -524,17 +574,6 @@ func (a *Application) pick(ctx context.Context, global globalOptions, args []str
 	if !clean {
 		return clierror.New(clierror.Failure, "working tree has changes; commit or stash them before running kit pick")
 	}
-	if opts.submit {
-		ctx = withInsecureHTTPWarningOnce(ctx)
-		repository, err := reviewRepository(ctx, service, config)
-		if err != nil {
-			return err
-		}
-		warnInsecureHTTP(ctx, a.IO.ErrOut, repository)
-		if _, err := a.ReviewClient(repository); err != nil {
-			return clierror.Wrap(clierror.Failure, err, "initialize review provider before pick")
-		}
-	}
 	if opts.fetch || opts.submit {
 		if err := service.Fetch(ctx, config.Remote); err != nil {
 			return clierror.Wrap(clierror.Failure, err, "fetch %s", config.Remote)
@@ -542,6 +581,10 @@ func (a *Application) pick(ctx context.Context, global globalOptions, args []str
 	}
 	if err := verifyRevisions(ctx, service, opts.base, opts.source); err != nil {
 		return err
+	}
+	opts.excludedMerges, err = service.MergeCount(ctx, opts.base, opts.source)
+	if err != nil {
+		return clierror.Wrap(clierror.Failure, err, "count excluded work merges")
 	}
 	synced, err := service.IsAncestor(ctx, opts.base, opts.source)
 	if err != nil {
@@ -607,44 +650,47 @@ func (a *Application) pick(ctx context.Context, global globalOptions, args []str
 		renderer.Success("Work", "미반영 커밋이 없습니다.")
 		return nil
 	}
-	items := make([]selector.Item, 0, len(pending))
-	byHash := make(map[string]gitservice.Commit, len(pending))
-	for _, commit := range pending {
-		subject := ui.SafeText(commit.Subject)
-		items = append(items, selector.Item{ID: commit.Hash, Display: fmt.Sprintf("%-10s  %-16s  %s", commit.ShortHash, commit.Date, subject), Search: commit.ShortHash + " " + commit.Date + " " + subject})
-		byHash[commit.Hash] = commit
-	}
-	if a.Select == nil {
-		return clierror.New(clierror.Failure, "interactive selection is unavailable")
-	}
-	selectedItems, err := a.Select(items, fmt.Sprintf("%s → %s (%s에서 새 브랜치)", opts.source, opts.target, opts.base))
-	if errors.Is(err, selector.ErrCanceled) {
-		fmt.Fprintln(a.IO.Out, "취소되었습니다.")
-		return nil
-	}
-	if errors.Is(err, selector.ErrInterrupted) {
-		return clierror.New(clierror.Interrupt, "interrupted")
-	}
-	if errors.Is(err, selector.ErrNotTTY) {
-		return clierror.New(clierror.Failure, "kit pick requires an interactive TTY; non-interactive commit selection is not supported")
-	}
-	if err != nil {
-		return clierror.Wrap(clierror.Failure, err, "open commit selector")
-	}
-	if len(selectedItems) == 0 {
-		fmt.Fprintln(a.IO.Out, "선택한 커밋이 없어 취소되었습니다.")
-		return nil
-	}
-	selected := make([]gitservice.Commit, 0, len(selectedItems))
-	for _, item := range selectedItems {
-		selected = append(selected, byHash[item.ID])
+	selected := pending
+	if !opts.all {
+		items := make([]selector.Item, 0, len(pending))
+		byHash := make(map[string]gitservice.Commit, len(pending))
+		for _, commit := range pending {
+			subject := ui.SafeText(commit.Subject)
+			items = append(items, selector.Item{ID: commit.Hash, Display: fmt.Sprintf("%-10s  %-16s  %s", commit.ShortHash, commit.Date, subject), Search: commit.ShortHash + " " + commit.Date + " " + subject})
+			byHash[commit.Hash] = commit
+		}
+		if a.Select == nil {
+			return clierror.New(clierror.Failure, "interactive selection is unavailable")
+		}
+		selectedItems, selectErr := a.Select(items, fmt.Sprintf("%s → %s (%s에서 새 브랜치)", opts.source, opts.target, opts.base))
+		if errors.Is(selectErr, selector.ErrCanceled) {
+			fmt.Fprintln(a.IO.Out, "취소되었습니다.")
+			return nil
+		}
+		if errors.Is(selectErr, selector.ErrInterrupted) {
+			return clierror.New(clierror.Interrupt, "interrupted")
+		}
+		if errors.Is(selectErr, selector.ErrNotTTY) {
+			return clierror.New(clierror.Failure, "kit pick requires an interactive TTY; use --all to select every pending commit")
+		}
+		if selectErr != nil {
+			return clierror.Wrap(clierror.Failure, selectErr, "open commit selector")
+		}
+		if len(selectedItems) == 0 {
+			fmt.Fprintln(a.IO.Out, "선택한 커밋이 없어 취소되었습니다.")
+			return nil
+		}
+		selected = make([]gitservice.Commit, 0, len(selectedItems))
+		for _, item := range selectedItems {
+			selected = append(selected, byHash[item.ID])
+		}
 	}
 	a.printPickSummary(opts, selected)
 	reader := bufio.NewReader(a.IO.In)
 	if !opts.yes {
 		prompt := "선택한 커밋으로 로컬 브랜치를 만드시겠습니까? [y/N] "
 		if opts.submit {
-			prompt = "선택한 커밋으로 브랜치를 만들고 push와 Gitea PR을 생성하시겠습니까? [y/N] "
+			prompt = "선택한 커밋으로 브랜치를 만들고 push·Gitea PR을 생성하시겠습니까? [y/N] "
 		}
 		fmt.Fprint(a.IO.Out, prompt)
 		answer, readErr := reader.ReadString('\n')
@@ -657,6 +703,9 @@ func (a *Application) pick(ctx context.Context, global globalOptions, args []str
 			return nil
 		}
 	}
+	if existing, loadErr := pickstate.Load(ctx, service); loadErr == nil {
+		return clierror.New(clierror.Conflict, "kit pick %s is already in progress; resume it before starting another pick", existing.TargetBranch)
+	}
 	originalHash, originalBranch, err := service.Head(ctx)
 	if err != nil {
 		return clierror.Wrap(clierror.Failure, err, "record current checkout")
@@ -664,7 +713,7 @@ func (a *Application) pick(ctx context.Context, global globalOptions, args []str
 	state := pickstate.State{
 		OriginalHash: originalHash, OriginalBranch: originalBranch, TargetBranch: opts.target,
 		BaseBranch: opts.base, SourceBranch: opts.source,
-		SubmitAfterPick: opts.submit, WaitAfterSubmit: opts.wait,
+		SubmitAfterPick: opts.submit,
 	}
 	for _, commit := range selected {
 		state.Commits = append(state.Commits, commit.Hash)
@@ -676,23 +725,24 @@ func (a *Application) pick(ctx context.Context, global globalOptions, args []str
 		_ = pickstate.Remove(ctx, service)
 		return clierror.Wrap(clierror.Failure, err, "create branch %q from %q", opts.target, opts.base)
 	}
+	if err := service.MarkKitCreatedBranch(ctx, opts.target); err != nil {
+		_ = service.RestoreAndDeleteBranch(ctx, originalHash, originalBranch, opts.target)
+		_ = pickstate.Remove(ctx, service)
+		return clierror.Wrap(clierror.Failure, err, "mark Kit-created branch %q", opts.target)
+	}
 	return a.runPick(ctx, opts.globalOptions, service, state, reader)
 }
 
 func (a *Application) runPick(ctx context.Context, global globalOptions, service gitservice.Service, state pickstate.State, reader *bufio.Reader) error {
+	return a.runPickLocked(ctx, global, service, state, reader)
+}
+
+func (a *Application) runPickLocked(ctx context.Context, global globalOptions, service gitservice.Service, state pickstate.State, reader *bufio.Reader) error {
 	for {
 		if state.Next >= len(state.Commits) {
-			tip, err := service.RevisionHash(ctx, state.TargetBranch)
+			_, err := service.RevisionHash(ctx, state.TargetBranch)
 			if err != nil {
 				return clierror.Wrap(clierror.Failure, err, "read completed review branch")
-			}
-			reviewState := reviewstate.State{
-				Stage: reviewstate.StagePicked, Branch: state.TargetBranch,
-				SourceBranch: state.SourceBranch, TargetBranch: state.BaseBranch,
-				SourceCommits: append([]string(nil), state.Commits...), PickedTip: tip,
-			}
-			if err := reviewstate.Save(ctx, service, reviewState); err != nil {
-				return clierror.Wrap(clierror.Failure, err, "save completed review state")
 			}
 			if err := pickstate.Remove(ctx, service); err != nil {
 				return clierror.Wrap(clierror.Failure, err, "remove completed pick state")
@@ -700,14 +750,14 @@ func (a *Application) runPick(ctx context.Context, global globalOptions, service
 			if state.SubmitAfterPick {
 				pushAttempted := false
 				err := a.reviewSubmit(ctx, global, reviewSubmitOptions{
-					wait: state.WaitAfterSubmit, removeSourceBranch: true, confirmed: true,
-					pushAttempted: &pushAttempted,
+					removeSourceBranch: true, confirmed: true,
+					pushAttempted: &pushAttempted, embedded: true,
 				}, &service)
 				if err == nil {
 					return nil
 				}
 				if pushAttempted {
-					return clierror.Wrap(clierror.Code(err), err, "review submit did not finish after push started; %s and its review state were kept for retry", state.TargetBranch)
+					return clierror.Wrap(clierror.Code(err), err, "review submit did not finish after push started; local and remote branch %s were kept; verify the PR manually", state.TargetBranch)
 				}
 				if rollbackErr := rollbackPickBeforePush(service, state); rollbackErr != nil {
 					return clierror.Wrap(clierror.Code(err), err, "review submit failed before push; automatic rollback was incomplete: %v", rollbackErr)
@@ -715,9 +765,9 @@ func (a *Application) runPick(ctx context.Context, global globalOptions, service
 				return clierror.Wrap(clierror.Code(err), err, "review submit failed before push; restored %s and removed %s", state.OriginalBranch, state.TargetBranch)
 			}
 			renderer := a.renderer(global)
-			renderer.Command("pick")
+			renderer.Section("준비")
 			renderer.Success("Branch", fmt.Sprintf("%s · %d개 커밋", state.TargetBranch, len(state.Commits)))
-			renderer.Next("kit review submit")
+			renderer.Next("kit review submit " + ui.ShellQuote(state.TargetBranch))
 			return nil
 		}
 		commit, err := service.Commit(ctx, state.Commits[state.Next])
@@ -775,6 +825,7 @@ func rollbackPickBeforePush(service gitservice.Service, state pickstate.State) e
 	if err := service.RestoreAndDeleteBranch(rollbackCtx, state.OriginalHash, state.OriginalBranch, state.TargetBranch); err != nil {
 		return err
 	}
+	_ = service.ClearKitCreatedBranch(rollbackCtx, state.TargetBranch)
 	headHash, headBranch, err := service.Head(rollbackCtx)
 	if err != nil {
 		return fmt.Errorf("verify original checkout: %w", err)
@@ -789,9 +840,6 @@ func rollbackPickBeforePush(service gitservice.Service, state pickstate.State) e
 	if exists {
 		return fmt.Errorf("verify target branch removal: %s still exists", state.TargetBranch)
 	}
-	if err := reviewstate.Delete(rollbackCtx, service, state.TargetBranch); err != nil {
-		return fmt.Errorf("target branch %s was removed, but picked review state cleanup failed: %w", state.TargetBranch, err)
-	}
 	return nil
 }
 
@@ -804,12 +852,12 @@ func (a *Application) resumePick(ctx context.Context, global globalOptions, serv
 		return a.abortPick(ctx, service, state)
 	}
 	if state.Next >= len(state.Commits) {
-		return a.runPick(ctx, global, service, state, bufio.NewReader(a.IO.In))
+		return a.runPickLocked(ctx, global, service, state, bufio.NewReader(a.IO.In))
 	}
 	if err := a.advancePick(ctx, service, &state, action); err != nil {
 		return err
 	}
-	return a.runPick(ctx, global, service, state, bufio.NewReader(a.IO.In))
+	return a.runPickLocked(ctx, global, service, state, bufio.NewReader(a.IO.In))
 }
 
 func (a *Application) advancePick(ctx context.Context, service gitservice.Service, state *pickstate.State, action string) error {
@@ -877,6 +925,7 @@ func (a *Application) abortPick(ctx context.Context, service gitservice.Service,
 	if err := service.RestoreAndDeleteBranch(ctx, state.OriginalHash, state.OriginalBranch, state.TargetBranch); err != nil {
 		return clierror.Wrap(clierror.Failure, err, "cherry-pick was aborted, but target branch cleanup failed")
 	}
+	_ = service.ClearKitCreatedBranch(ctx, state.TargetBranch)
 	if err := pickstate.Remove(ctx, service); err != nil {
 		return clierror.Wrap(clierror.Failure, err, "remove pick state")
 	}
@@ -885,19 +934,34 @@ func (a *Application) abortPick(ctx context.Context, service gitservice.Service,
 
 func (a *Application) printPickSummary(opts pickOptions, selected []gitservice.Commit) {
 	renderer := a.renderer(opts.globalOptions)
-	renderer.Command("pick plan")
-	renderer.Section("브랜치")
+	renderer.Command("pick")
+	renderer.Section("준비")
 	renderer.Field("New", opts.target)
 	renderer.Field("Base", opts.base)
 	renderer.Field("Work", opts.source)
+	if opts.excludedMerges > 0 {
+		renderer.Warning("Excluded", fmt.Sprintf("work merge %d개와 side-parent 경로는 선택 후보에 포함되지 않습니다", opts.excludedMerges))
+	}
 	if opts.submit {
 		renderer.Field("Action", "브랜치 생성 · push · Gitea PR 생성")
 	} else {
 		renderer.Field("Action", "로컬 브랜치 생성")
 	}
 	renderer.Section(fmt.Sprintf("선택한 커밋 · %d개", len(selected)))
-	for _, commit := range selected {
+	displayed := selected
+	const compactLimit = 20
+	const compactTail = 3
+	if opts.all && len(selected) > compactLimit {
+		displayed = selected[:compactLimit-compactTail]
+	}
+	for _, commit := range displayed {
 		renderer.Pending(commit.ShortHash, commit.Subject)
+	}
+	if len(displayed) != len(selected) {
+		renderer.Field("…", fmt.Sprintf("%d개 생략", len(selected)-len(displayed)-compactTail))
+		for _, commit := range selected[len(selected)-compactTail:] {
+			renderer.Pending(commit.ShortHash, commit.Subject)
+		}
 	}
 	fmt.Fprintln(a.IO.Out)
 }
@@ -979,10 +1043,13 @@ func printRootHelp(w io.Writer) {
 Usage:
   kit [global options] <command> [arguments]
 
-Commands:
-  status    Show the work queue, base synchronization, and tracked reviews
-  pick      Select work commits, push a branch, and create a Gitea PR
-  sync      Finish a merged review or synchronize develop and work
+Daily workflow:
+  compare   Show pending work commits and already-applied work
+  pick      Select commits, push a branch, and create a PR
+
+Advanced and recovery:
+  status    Show detailed repository, queue, and tracked-review state
+  sync      Update develop and rebuild work from first-parent pending commits
   review    Advanced review inspection and recovery commands
   backup    List, create, restore, and clean work backups
 
@@ -993,8 +1060,7 @@ Setup and maintenance:
   update    Update the installed kit binary
   version   Print build information
 
-Advanced compatibility:
-  compare   Show commit-level work/base comparison
+Compatibility:
   git       Legacy namespace; existing 'kit git ...' commands remain supported
   self      Legacy namespace for version, update, and doctor
 
@@ -1027,9 +1093,11 @@ Options:
   --base <branch>  Base branch; custom values require --local (default: develop)
   --fetch          Fetch the configured remote before selection
   --allow-stale    Allow an outdated source branch (recovery only)
+  --all            Select every pending commit without opening the selector
   --local          Create the local branch without push or PR creation
-  --wait           Create the PR, then wait for its result
-  --submit         Compatibility option; submission is now the default
+  --no-wait        Deprecated compatibility option; Create always returns immediately
+  --wait           Deprecated compatibility option; Create always returns immediately
+  --submit         Compatibility option; submission is the default
   --continue       Continue a paused kit pick after staging resolutions
   --skip           Skip the current commit in a paused kit pick
   --abort          Abort a paused kit pick and restore the original checkout

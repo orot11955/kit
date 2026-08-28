@@ -9,7 +9,6 @@ import (
 
 	gitservice "kit/internal/git"
 	"kit/internal/hosting"
-	"kit/internal/reviewstate"
 )
 
 func TestPrintWorkflowConfigIncludesInsecureHTTPOptIn(t *testing.T) {
@@ -66,23 +65,5 @@ func TestInsecureHTTPWarningIsWrittenOnceToErrorOutput(t *testing.T) {
 	}
 	if stdout.Len() != 0 {
 		t.Fatalf("warning polluted stdout: %q", stdout.String())
-	}
-}
-
-func TestReviewStateOriginMustMatchRepositoryRemote(t *testing.T) {
-	repository := hosting.Resolve("gitea", "http://10.0.0.20:3000/owner/repo.git")
-	repository.AllowInsecureHTTP = true
-	for _, test := range []struct {
-		url   string
-		match bool
-	}{
-		{url: "http://10.0.0.20:3000/owner/repo/pulls/7", match: true},
-		{url: "https://10.0.0.20:3000/owner/repo/pulls/7"},
-		{url: "http://10.0.0.21:3000/owner/repo/pulls/7"},
-	} {
-		state := reviewstate.State{ReviewURL: test.url}
-		if got := reviewStateOriginMatchesRepository(state, repository); got != test.match {
-			t.Fatalf("origin match=%t, want %t for %s", got, test.match, test.url)
-		}
 	}
 }

@@ -28,7 +28,6 @@ $HOME/.local/bin/kit compare
 # 새 terminal부터 PATH로 사용
 kit compare
 kit pick feat/login
-kit pick feat/login --wait
 
 # 이후 업데이트
 kit update
@@ -92,7 +91,9 @@ source = work
 base   = develop
 ```
 
-출력은 반영 완료와 미반영 commit을 구분한다.
+출력은 반영 완료와 미반영 commit을 구분한다. compare는 Git 기록만 비교하며 provider API나
+기존 review metadata를 조회하지 않는다. metadata는 legacy 진단 기록으로 남지만 후보를 예약하거나
+자동으로 삭제하지 않는다.
 
 ```text
 STAT  HASH      DATE              MESSAGE
@@ -103,12 +104,13 @@ STAT  HASH      DATE              MESSAGE
 ## 3.2 `kit pick`
 
 source 브랜치의 미반영 commit을 대화형으로 선택하고, base에서 새 브랜치를 만든 뒤
-선택한 commit을 source history의 위상 순서대로 `git cherry-pick -x`하는 명령이다.
+선택한 commit을 source history의 위상 순서대로 `git cherry-pick -x`한다. review branch를
+push하고 Gitea PR을 생성하면 즉시 반환한다.
 
 ```bash
 kit pick feat/login
-kit pick feat/login --from work
-kit pick feat/login --from work --base develop
+kit pick chore/refactor --all
+kit pick feat/local --local
 ```
 
 첫 번째 positional argument는 새로 만들 branch다. 이를 commit hash로 해석하지 않는다.
@@ -119,7 +121,13 @@ source의 미반영 commit 조회
   → 실행 내용 확인
   → base에서 새 branch 생성
   → git cherry-pick -x
+  → push · Gitea PR 생성
+  → 즉시 반환
 ```
+
+Gitea의 PR Create 요청이 실패하거나 불완전한 metadata를 반환하면 local/remote branch는 보존한다.
+재시도 전에 Gitea에서 PR 생성 여부를 수동으로 확인해야 한다. `--local`은 review branch를 로컬에만
+생성하는 고급 경로다.
 
 working tree가 dirty하거나 대상 branch가 이미 있으면 아무것도 변경하지 않고 실패한다.
 conflict가 발생하면 다음 Git 동작을 제공한다.
@@ -136,6 +144,8 @@ commit dependency 순서를 보장하지 않기 때문이다. source revision wa
 
 commit 선택은 Go binary에 포함된 full-screen fuzzy multi-select UI를 사용한다. 외부
 `fzf` executable은 요구하지 않으며 설치 직후 `kit pick`을 사용할 수 있어야 한다.
+`--all`은 selector를 열지 않고 미반영 commit 전체를 기존 위상 순서대로 선택한다.
+대량 refactoring처럼 후보가 많은 경우에도 최종 실행 확인과 기존 rollback 계약은 그대로 유지한다.
 Go TUI library는 build dependency로 고정하여 최종 binary에 포함한다.
 
 기본 key 계약:
@@ -163,10 +173,22 @@ work     원격에 push하지 않는 local commit queue
 feat/*   develop에서 만들어 Gitea PR로 올리는 일회성 branch
 ```
 
-다른 개발자의 merge로 `develop`이 바뀌면 `work`에 단순 merge하지 않는다. merge conflict
-해결이 merge commit에만 남으면 이후 개별 work commit을 뽑을 때 그 해결을 재사용할 수 없기
-때문이다. `kit sync`는 `origin/develop`을 fast-forward한 뒤 기존 work backup을 만들고,
-최신 develop에서 미반영 work commit만 위상 순서대로 재적용한다. 재구성 실패 시 기존 work,
+일상 흐름은 `kit compare`, `kit pick <branch>`, `kit sync` 세 단계다.
+
+```text
+kit compare  →  남은 work 커밋 확인
+kit pick     →  선택 · push · Gitea PR 생성 후 반환
+Gitea merge  →  kit sync로 local Git queue 동기화
+```
+
+`compare`, `status`, `sync`는 provider API를 호출하지 않는다. 기존 review metadata는 읽기 전용
+legacy 기록이다. `status`, `review`, `backup`은 상세 진단·복구를 위한 고급 경로이며, `kit git ...`와 `kit self ...` namespace는 기존
+사용자와 자동화를 위해 호환 유지한다.
+
+다른 개발자의 merge로 `develop`이 바뀌면 `kit sync`는 `origin/develop`을 fast-forward한 뒤,
+기존 work를 backup branch로 보존하고 최신 develop에서 work를 재구성한다. 재적용 대상은 work의
+direct first-parent 일반 pending commit뿐이며, merge commit과 side-parent commit은 제외한다.
+재구성 실패 시 기존 work,
 원 checkout과 이번 실행 전 develop hash를 복원하고 모두 검증한다. 검증에 성공한 경우 그
 실패 실행에서 생성한 자동 backup을 삭제하며, 복원 또는 삭제를 검증하지 못하면 backup을
 남기고 정확한 이름을 오류에 포함한다. 재적용 충돌은 임시 branch에서 해결하며
@@ -176,14 +198,17 @@ feat/*   develop에서 만들어 Gitea PR로 올리는 일회성 branch
 처리한다.
 외부 해결 commit 이후 다음 충돌이나 오류로 재구성이 중단되면 임시 HEAD를
 `kit/recovery/*` branch로 보존한 뒤 원래 `work`와 checkout을 복원한다.
-skip한 commit은 결과의 `skipped`로 표시되고 backup에는 남는다. 전체 적용이 끝나기 전에는
-`work` branch를 이동하지 않는다.
+skip한 commit은 결과의 `skipped`로 표시되고 backup에는 남는다. 성공한 sync 뒤에도 원본 work backup은
+복구용으로 남는다. 전체 적용이 끝나기 전에는 `work` branch를 이동하지 않는다.
+
+고급·복구 명령은 다음처럼 구분한다.
 
 ```bash
+# 상세 상태와 cached legacy review metadata 확인
 kit status
-kit status --cached
-kit sync --dry-run
-kit sync
+
+# legacy metadata와 backup 복구
+kit review list
 kit backup list
 kit backup restore <backup-branch>
 kit backup cleanup --dry-run
@@ -204,9 +229,14 @@ restore의 safety backup은 명시적으로 cleanup할 때까지 유지한다.
 
 `develop`이 `work`의 ancestor가 아니면 work는 `STALE`이다. `kit compare`는 경고와 상태를
 표시하지만 read-only로 실행한다. 기본 `kit pick`은 원격 base를 fetch하고 동기화가
-필요하면 `kit sync`를 먼저 실행한다. 사용자 지정 `--from`/`--base` 흐름에서는 branch
-계약을 자동으로 추정하지 않고 `kit sync`를 안내한다. 장애 복구에만 `--allow-stale`을
+필요하면 내부적으로 안전한 동기화를 먼저 실행한다. 사용자 지정 `--from`/`--base` 흐름은
+로컬 branch 생성에만 쓰며 remote workflow 계약을 자동으로 추정하지 않는다. 장애 복구에만 `--allow-stale`을
 명시적으로 사용할 수 있다.
+
+`sync`는 최신 develop에서 work를 항상 재구성한다. work의 direct first-parent 일반 pending commit만
+다시 적용하고 merge commit과 side-parent에서만 reachable한 commit은 제외한다. 실행 전 제외 범위를
+경고하며, 성공 뒤 원본 work는 backup branch로 남아 사용자가 복원할 수 있다. side 작업은 work에 merge하지
+말고 필요한 변경을 direct commit으로 남기거나 별도 review branch로 올려 관리한다.
 
 `pick`은 commit을 하나씩 적용하고 `$(git rev-parse --git-path kit)/pick-state.json`에
 진행 상태를 저장한다. process가 끝나도 다음 명령으로 이어갈 수 있다.
@@ -263,28 +293,21 @@ Gitea API token은 필요로 하지 않으며 provider에 맞는 PR 생성 주�
 ```bash
 kit review submit
 kit review status [branch]
-kit review wait [branch]
-kit review finish [branch]
 kit review list
 ```
 
-`submit`은 현재 branch를 push한 다음 같은 source/target의 열린 review를 정확히 조회한다.
-하나면 재사용하고, 없으면 Gitea PR을 생성하며, 둘 이상이면 임의 선택하지
-않고 중단한다. `kit pick`은 기본적으로 submit까지 수행하며 local branch 생성 전에 provider와
-credential을 preflight한다. `--local`은 push와 PR 생성 없이 local branch만 만든다.
-pick 완료 뒤 push 시도 전 submit이 실패하면 원 checkout을 검증하고 생성한 branch와 picked
-state를 삭제한다. push 시도가 시작된 뒤에는 원격 반영 여부를 단정할 수 없으므로 local
-branch와 review state를 보존해 같은 submit/status/wait 명령으로 복구한다.
+`submit`은 현재 branch를 push한 뒤 Gitea PR Create 요청을 한 번 수행하고 즉시 반환한다. 기존 PR을
+Find/Get으로 조회하거나 재사용하지 않는다. `kit pick`도 같은 Create-only 흐름을 수행한다. `--local`은
+push와 PR 생성 없이 local branch만 만든다. push가 시작된 뒤 PR 생성이 실패하면 원격 반영 여부를
+단정할 수 없으므로 branch와 legacy review metadata를 보존한다. Gitea에서 PR 존재 여부를 수동으로
+확인해야 한다.
 
-상위 `kit sync`는 active review state를 provider에서 먼저 갱신한다. 머지된 review가 하나면
-동일한 finish 검증과 work 재구성, local branch 삭제를 한 transaction으로 실행한다. 동시에
-머지된 review가 여러 개면 순서를 추정하지 않고 `kit review finish <branch>`를 요구한다.
-`--base-only`는 review API를 의도적으로 건너뛰는 복구 경로다. 기존 `kit git sync`는 자동
-review finish를 수행하지 않는 호환 동작으로 유지한다.
-
-상위 `kit status`는 active review를 provider에서 갱신하지만 전체 조회에 5초 제한을 둔다.
-제한 안에 확인하지 못한 review는 저장된 상태와 refresh 경고를 함께 표시한다. `--cached`는
-provider 요청 없이 저장된 review 상태만 읽는 빠른 경로다.
+상위 `kit sync`와 `kit status`는 provider API를 호출하지 않는다. `sync`는 Git만 사용해 base를
+fast-forward하고 work를 재구성하며, PR merge 여부나 provider branch head를 검증하지 않는다. 재구성 뒤에는
+향후 Kit-created marker가 기록된 local review branch만 후보로 삼고, branch tip이 현재 base의 ancestor인 경우에만
+non-force local 삭제한다. squash merge와 non-ancestor branch, marker가 없는 branch, stable/base/work는
+보존한다. remote branch는 삭제하지 않으며 cleanup 오류는 sync 결과의 warning일 뿐 실패가 아니다. 현재
+checkout한 후보는 upstream이 정확히 `origin/<branch>`일 때에만 work로 전환한 뒤 정리한다.
 
 상태는 `.git/kit/reviews/<branch-sha256>.json`에 atomic write하며 token은 기록하지 않는다.
 Gitea token은 `kit auth login gitea --host <host>`로 macOS Keychain 또는 Linux Secret
@@ -294,6 +317,17 @@ Service에 host별로 등록한다. keyring 자체가 profile을 열거하지 �
 mode `0600` local credential file을 사용할 수 있다. macOS에서는 자동 우회하지 않으며,
 backend가 잠겼거나 권한 오류가 난 경우에도 file로 자동 우회하지 않는다. project 설정,
 Git config, review state, JSON 출력과 log에는 token을 기록하지 않는다.
+
+macOS에서 token lookup이 login Keychain 잠금 때문에 사용자 상호작용을 요구하면, 일반 TTY의
+`pick`/`review` 실행은 `security unlock-keychain <login.keychain>`을 password argument 없이
+한 번 호출하고 표준 macOS 비밀번호 prompt에 연결한다. 해제에 성공하면 같은 token lookup을
+한 번 재시도한다. kit는 Keychain의 lock-on-sleep, 자동 잠금 시간 또는 접근 제어를 변경하지
+않고, token을 환경 변수나 평문 file로 자동 대체하지 않는다. JSON·CI·pipe처럼 TTY가 없는
+실행은 prompt를 열 수 없으므로 사용자가 먼저 다음 명령을 대화형 terminal에서 실행해야 한다.
+
+```bash
+security unlock-keychain "$HOME/Library/Keychains/login.keychain-db"
+```
 
 `KIT_GITEA_TOKEN`과 `KIT_GITEA_HOST`는 CI/일회성 override로만 지원하며 반드시 함께
 지정한다. 환경 변수 쌍이 있으면 저장 credential보다 우선하고, 불완전한 쌍이면 실패한다.
@@ -312,19 +346,9 @@ branch 삭제 여부는 Gitea repository 정책에 맡기며 API token으로 임
 같은 repository의 branch PR만 지원하며 fork → upstream PR은 별도의 head owner/remote 계약을
 추가하기 전까지 명시적으로 지원하지 않는다.
 
-`wait`는 daemon이나 OS notification을 추가하지 않는 foreground polling이다. merge가
-확인되면 알림과 다음 명령을 출력한다. 개별 provider 요청 timeout은 60초이며 일시적 network
-timeout은 stderr에 retry 상태를 표시하고 다음 poll에서 다시 요청한다. 명시적인 인증·계약
-오류는 즉시 중단하고 `Ctrl-C` 또는 전체 `--timeout`은 state를 유지한 채 종료한다.
-`--yes`를 주면 `finish`까지 이어간다. `finish`는
-provider가 merge한 review인지, local branch가 submit 시점 tip과 같은지 확인한 후에만
-`develop` fetch/fast-forward와 `work` 재구성을 실행한다. review state에 보존한 원본 work
-commit 목록은 squash merge에서도 해당 작업을 안전하게 제거하는 신뢰 집합으로 사용한다.
-일반적인 `sync`의 `-x`/patch-id 판정은 review state가 없을 때의 fallback으로 유지한다.
-
-로컬 review branch는 먼저 `git branch -d`로 정리한다. provider merge와 tip 검증을 모두
-통과했지만 squash 때문에 safe delete가 실패한 경우에만 사용자가 `--force-delete`를
-명시할 수 있다. kit는 remote branch를 직접 강제 삭제하지 않는다.
+`sync`의 `cherry-pick -x`/patch-id 비교는 squash merge를 완전하게 판별하지 못할 수 있다. squash
+merge 뒤 필요한 커밋이 여전히 pending으로 보이면 Gitea와 Git history를 수동 확인해야 하며, kit는
+review metadata로 이를 보정하지 않는다.
 
 ---
 
@@ -808,12 +832,11 @@ kit update
 ## v0.3 — 협업 Git workflow
 
 ```text
-kit status
-kit sync
-kit pick / --local / --wait
-kit review submit / status / wait / finish / list
-kit backup list / create / restore / cleanup
+kit compare → kit pick → Gitea merge → kit sync
+kit pick / --all / --local
+legacy metadata: status / review
 legacy kit git namespace compatibility
+kit backup list / create / restore / cleanup
 kit auth login / status / list / logout
 repository-local kit.git.* config
 Gitea provider와 legacy provider 호환
@@ -822,7 +845,7 @@ Gitea provider와 legacy provider 호환
 
 완료 조건:
 
-- 다른 개발자의 merge 후 최신 develop 위에 pending work commit만 재구성한다.
+- 다른 개발자의 merge 후 최신 develop 위에 direct first-parent pending work commit만 재구성하고, 원본 work backup을 남긴다.
 - sync 실패 시 기존 work, checkout과 develop을 검증된 상태로 되돌리고 실패 backup을 정리한다.
 - stale work에서는 새 review branch 생성을 차단한다.
 - 회사와 개인 Gitea repository에서 같은 local 명령을 사용한다.

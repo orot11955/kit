@@ -134,6 +134,86 @@ func (s Service) ConfigUnset(ctx context.Context, name string) error {
 	return err
 }
 
+// MarkKitCreatedBranch records only Kit-created review branches. It deliberately
+// exposes no general branch config writer.
+func (s Service) MarkKitCreatedBranch(ctx context.Context, branch string) error {
+	if err := s.ValidateBranchName(ctx, branch); err != nil {
+		return err
+	}
+	_, err := s.run(ctx, "config", "--local", "branch."+branch+".kitCreated", "true")
+	return err
+}
+
+func (s Service) IsKitCreatedBranch(ctx context.Context, branch string) (bool, error) {
+	if err := s.ValidateBranchName(ctx, branch); err != nil {
+		return false, err
+	}
+	branches, err := s.KitCreatedBranches(ctx)
+	if err != nil {
+		return false, nil
+	}
+	for _, marked := range branches {
+		if marked == branch {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s Service) ClearKitCreatedBranch(ctx context.Context, branch string) error {
+	if err := s.ValidateBranchName(ctx, branch); err != nil {
+		return err
+	}
+	// Clear by exact key rather than by marker value: a stale or corrupted
+	// marker must not remain merely because it is no longer trusted for cleanup.
+	_, err := s.run(ctx, "config", "--local", "--unset-all", "branch."+branch+".kitCreated")
+	if err != nil {
+		// git config uses a non-zero status when the key is already absent. That
+		// is the desired postcondition for rollback and branch deletion.
+		if strings.Contains(err.Error(), "exit status 5") {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// KitCreatedBranches returns only branches carrying Kit's review-branch marker.
+// It deliberately does not expose arbitrary repository config enumeration.
+func (s Service) KitCreatedBranches(ctx context.Context) ([]string, error) {
+	out, err := s.run(ctx, "config", "--local", "--get-regexp", "^branch\\..*\\.kitcreated$")
+	if err != nil {
+		return nil, nil
+	}
+	const prefix = "branch."
+	const suffix = ".kitcreated"
+	values := make(map[string][]string)
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		key := fields[0]
+		lowerKey := strings.ToLower(key)
+		if !strings.HasPrefix(lowerKey, prefix) || !strings.HasSuffix(lowerKey, suffix) {
+			continue
+		}
+		branch := key[len(prefix) : len(key)-len(suffix)]
+		if err := s.ValidateBranchName(ctx, branch); err != nil {
+			continue
+		}
+		values[branch] = append(values[branch], strings.TrimSpace(strings.TrimPrefix(line, key)))
+	}
+	var branches []string
+	for branch, markerValues := range values {
+		if len(markerValues) == 1 && markerValues[0] == "true" {
+			branches = append(branches, branch)
+		}
+	}
+	sort.Strings(branches)
+	return branches, nil
+}
+
 func (s Service) InitializeWorkflowConfig(ctx context.Context) (WorkflowConfig, error) {
 	config := s.WorkflowConfig(ctx)
 	values := map[string]string{

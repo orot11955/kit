@@ -26,8 +26,9 @@ const (
 )
 
 var (
-	ErrCredentialNotFound = errors.New("credential not found")
-	ErrKeyringUnavailable = errors.New("keyring is unavailable")
+	ErrCredentialNotFound          = errors.New("credential not found")
+	ErrKeyringUnavailable          = errors.New("keyring is unavailable")
+	ErrKeychainInteractionRequired = errors.New("macOS Keychain interaction required")
 )
 
 // Profile is safe to serialize for status and list output. It intentionally
@@ -419,6 +420,9 @@ func (m *Manager) keyringError(err error) error {
 		return fmt.Errorf("%w: %v", ErrKeyringUnavailable, err)
 	}
 	if m.goos == "darwin" {
+		if exitCodeIs(err, 36) {
+			return fmt.Errorf("%w: %v", ErrKeychainInteractionRequired, err)
+		}
 		return fmt.Errorf("macOS Keychain operation failed: %w", err)
 	}
 	return fmt.Errorf("keyring operation failed: %w", err)

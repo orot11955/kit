@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -305,7 +307,67 @@ func (a *Application) newReviewClient(repository hosting.Repository) (review.Cli
 	if err != nil {
 		return nil, err
 	}
-	return review.NewClientWithOptions(repository, review.Options{Lookup: service.Lookup})
+	return review.NewClientWithOptions(repository, review.Options{Lookup: func(provider, host string) (string, error) {
+		return a.lookupReviewCredential(service, provider, host)
+	}})
+}
+
+func (a *Application) lookupReviewCredential(service AuthService, provider, host string) (string, error) {
+	token, err := service.Lookup(provider, host)
+	if !errors.Is(err, auth.ErrKeychainInteractionRequired) {
+		return token, err
+	}
+	if !a.keychainUnlockSupported() || !a.allowKeychainUnlock || a.IO.InFile == nil || !a.keychainTTY(a.IO.InFile) {
+		return "", fmt.Errorf("%w; run security unlock-keychain \"$HOME/Library/Keychains/login.keychain-db\" in an interactive terminal, then retry", err)
+	}
+
+	fmt.Fprintln(a.IO.ErrOut, "kit · auth")
+	fmt.Fprintln(a.IO.ErrOut, "\n  ! Keychain    login Keychain 잠금을 해제합니다. macOS 비밀번호를 입력하세요.")
+	if unlockErr := a.keychainUnlocker()(a.IO.InFile); unlockErr != nil {
+		return "", fmt.Errorf("unlock macOS login Keychain: %w", unlockErr)
+	}
+	return service.Lookup(provider, host)
+}
+
+func (a *Application) keychainUnlockSupported() bool {
+	if a.KeychainSupported != nil {
+		return a.KeychainSupported()
+	}
+	return runtime.GOOS == "darwin"
+}
+
+func (a *Application) keychainTTY(input *os.File) bool {
+	if a.IsKeychainTTY != nil {
+		return a.IsKeychainTTY(input)
+	}
+	return isKeychainTerminal(input)
+}
+
+func (a *Application) keychainUnlocker() func(*os.File) error {
+	if a.UnlockKeychain != nil {
+		return a.UnlockKeychain
+	}
+	return unlockDarwinLoginKeychain
+}
+
+func isKeychainTerminal(input *os.File) bool {
+	return input != nil && term.IsTerminal(int(input.Fd()))
+}
+
+func unlockDarwinLoginKeychain(terminal *os.File) error {
+	if terminal == nil {
+		return errors.New("interactive terminal is required")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("resolve home directory: %w", err)
+	}
+	keychainPath := filepath.Join(home, "Library", "Keychains", "login.keychain-db")
+	command := exec.Command("/usr/bin/security", "unlock-keychain", keychainPath)
+	command.Stdin = terminal
+	command.Stdout = terminal
+	command.Stderr = terminal
+	return command.Run()
 }
 
 func terminalSecretReader(input *os.File, output io.Writer) func(string) (string, error) {
