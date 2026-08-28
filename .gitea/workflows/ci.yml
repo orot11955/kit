@@ -8,7 +8,8 @@ on:
 
 jobs:
   check:
-    runs-on: kit-ci
+    # 현재 등록된 Gitea Runner의 검증된 label
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: https://gitea.com/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

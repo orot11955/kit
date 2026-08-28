@@ -1,9 +1,8 @@
 name: deploy-docs
 
 on:
-  push:
-    branches:
-      - main
+  # 운영 배포는 전용 deploy Runner와 승인 절차를 구성한 뒤 수동 실행한다.
+  workflow_dispatch:
 
 concurrency:
   group: kit-docs-production
