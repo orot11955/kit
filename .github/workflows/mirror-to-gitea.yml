@@ -38,7 +38,17 @@ jobs:
             main|develop) ;;
             *) echo "unexpected branch: $GITHUB_REF_NAME" >&2; exit 1 ;;
           esac
-          git -c credential.helper='!f() { printf "username=orot\npassword=%s\n" "$GITEA_MIRROR_TOKEN"; }; f' \
-            -c core.askPass= \
-            push "$GITEA_URL" \
+          askpass="$RUNNER_TEMP/gitea-askpass"
+          cat >"$askpass" <<'EOF'
+          #!/usr/bin/env bash
+          case "${1:-}" in
+            *Username*) printf '%s\n' 'orot' ;;
+            *Password*) printf '%s\n' "$GITEA_MIRROR_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          EOF
+          chmod 0700 "$askpass"
+          GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+            git push "$GITEA_URL" \
             "refs/heads/$GITHUB_REF_NAME:refs/heads/$GITHUB_REF_NAME"
+          rm -f "$askpass"
