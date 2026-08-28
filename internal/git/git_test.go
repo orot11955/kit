@@ -163,7 +163,7 @@ func initRepositoryInPrivateTemp(t *testing.T) string {
 
 func privateTestTempDir(t *testing.T) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("/private/tmp", "kit-git-test-")
+	dir, err := os.MkdirTemp(t.TempDir(), "kit-git-test-")
 	if err != nil {
 		t.Fatal(err)
 	}
