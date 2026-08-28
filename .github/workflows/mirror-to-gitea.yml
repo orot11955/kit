@@ -1,0 +1,44 @@
+name: Mirror to Gitea
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gitea-mirror-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    name: Push ${{ github.ref_name }} to Gitea
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Push exact branch to Gitea
+        env:
+          GITEA_MIRROR_TOKEN: ${{ secrets.GITEA_MIRROR_TOKEN }}
+          GITEA_URL: https://git.2juho.com/orot/kit.git
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -Eeuo pipefail
+          : "${GITEA_MIRROR_TOKEN:?GITEA_MIRROR_TOKEN is not configured}"
+          case "$GITHUB_REF_NAME" in
+            main|develop) ;;
+            *) echo "unexpected branch: $GITHUB_REF_NAME" >&2; exit 1 ;;
+          esac
+          git -c credential.helper='!f() { printf "username=orot\npassword=%s\n" "$GITEA_MIRROR_TOKEN"; }; f' \
+            -c core.askPass= \
+            push "$GITEA_URL" \
+            "refs/heads/$GITHUB_REF_NAME:refs/heads/$GITHUB_REF_NAME"
