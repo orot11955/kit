@@ -12,6 +12,7 @@ import (
 type WorkflowConfig struct {
 	Provider          string `json:"provider"`
 	Remote            string `json:"remote"`
+	PushRemote        string `json:"push_remote,omitempty"`
 	Stable            string `json:"stable"`
 	Base              string `json:"base"`
 	Source            string `json:"source"`
@@ -28,9 +29,17 @@ func DefaultWorkflowConfig() WorkflowConfig {
 	}
 }
 
+func (c WorkflowConfig) PushRemoteName() string {
+	if strings.TrimSpace(c.PushRemote) != "" {
+		return c.PushRemote
+	}
+	return c.Remote
+}
+
 var workflowConfigKeys = map[string]string{
 	"git.provider":            "kit.git.provider",
 	"git.remote":              "kit.git.remote",
+	"git.push-remote":         "kit.git.push-remote",
 	"git.stable":              "kit.git.stable",
 	"git.base":                "kit.git.base",
 	"git.source":              "kit.git.source",
@@ -62,11 +71,12 @@ func (s Service) WorkflowConfig(ctx context.Context) WorkflowConfig {
 func (s Service) WorkflowConfigStrict(ctx context.Context) (WorkflowConfig, error) {
 	config := DefaultWorkflowConfig()
 	for name, target := range map[string]*string{
-		"git.provider": &config.Provider,
-		"git.remote":   &config.Remote,
-		"git.stable":   &config.Stable,
-		"git.base":     &config.Base,
-		"git.source":   &config.Source,
+		"git.provider":    &config.Provider,
+		"git.remote":      &config.Remote,
+		"git.push-remote": &config.PushRemote,
+		"git.stable":      &config.Stable,
+		"git.base":        &config.Base,
+		"git.source":      &config.Source,
 	} {
 		value, err := s.ConfigGet(ctx, name)
 		if errors.Is(err, ErrConfigNotSet) {
@@ -116,9 +126,6 @@ func (s Service) ConfigSet(ctx context.Context, name, value string) error {
 		switch value {
 		case "auto", "gitea", "generic":
 		case "gitlab", "forgejo":
-			// Legacy values remain readable and may be written back unchanged by
-			// config init so an in-flight review can be completed during cutover.
-			// New repository configuration must use the canonical Gitea provider.
 			current, currentErr := s.ConfigGet(ctx, name)
 			if currentErr != nil || current != value {
 				return fmt.Errorf("git.provider %s is legacy and cannot be newly configured; use gitea", value)
@@ -130,7 +137,7 @@ func (s Service) ConfigSet(ctx context.Context, name, value string) error {
 	if name == "git.allow-insecure-http" && value != "true" && value != "false" {
 		return fmt.Errorf("git.allow-insecure-http must be true or false")
 	}
-	if name == "git.remote" {
+	if name == "git.remote" || name == "git.push-remote" {
 		if err := validateRemoteName(value); err != nil {
 			return err
 		}
@@ -153,8 +160,6 @@ func (s Service) ConfigUnset(ctx context.Context, name string) error {
 	return err
 }
 
-// MarkKitCreatedBranch records only Kit-created review branches. It deliberately
-// exposes no general branch config writer.
 func (s Service) MarkKitCreatedBranch(ctx context.Context, branch string) error {
 	if err := s.ValidateBranchName(ctx, branch); err != nil {
 		return err
@@ -183,11 +188,8 @@ func (s Service) ClearKitCreatedBranch(ctx context.Context, branch string) error
 	if err := s.ValidateBranchName(ctx, branch); err != nil {
 		return err
 	}
-	// Clear by exact key rather than by marker value: a stale or corrupted
-	// marker must not remain merely because it is no longer trusted for cleanup.
 	_, err := s.run(ctx, "config", "--local", "--unset-all", "branch."+branch+".kitCreated")
 	if err != nil {
-		// Missing config is the desired postcondition for rollback and branch deletion.
 		if IsExitCode(err, 1) || IsExitCode(err, 5) {
 			return nil
 		}
@@ -196,8 +198,6 @@ func (s Service) ClearKitCreatedBranch(ctx context.Context, branch string) error
 	return nil
 }
 
-// KitCreatedBranches returns only branches carrying Kit's review-branch marker.
-// It deliberately does not expose arbitrary repository config enumeration.
 func (s Service) KitCreatedBranches(ctx context.Context) ([]string, error) {
 	out, err := s.run(ctx, "config", "--local", "--get-regexp", "^branch\\..*\\.kitcreated$")
 	if err != nil {
@@ -243,12 +243,16 @@ func (s Service) InitializeWorkflowConfig(ctx context.Context) (WorkflowConfig, 
 	values := map[string]string{
 		"git.provider":            config.Provider,
 		"git.remote":              config.Remote,
+		"git.push-remote":         config.PushRemote,
 		"git.stable":              config.Stable,
 		"git.base":                config.Base,
 		"git.source":              config.Source,
 		"git.allow-insecure-http": strconv.FormatBool(config.AllowInsecureHTTP),
 	}
 	for _, name := range WorkflowConfigNames() {
+		if name == "git.push-remote" && values[name] == "" {
+			continue
+		}
 		if err := s.ConfigSet(ctx, name, values[name]); err != nil {
 			return WorkflowConfig{}, err
 		}
