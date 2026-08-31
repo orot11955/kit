@@ -286,6 +286,7 @@ func (a *Application) reviewFinish(ctx context.Context, g globalOptions, o revie
 	if e != nil {
 		return e
 	}
+	c := s.WorkflowConfig(ctx)
 	branch, e := resolveReviewBranch(ctx, s, o.branch)
 	if e != nil {
 		return e
@@ -314,7 +315,7 @@ func (a *Application) reviewFinish(ctx context.Context, g globalOptions, o revie
 		return clierror.New(clierror.Failure, "PR #%d has unknown status %q", state.ReviewNumber, state.Status)
 	}
 	if !g.yes {
-		ok, confirmErr := confirm(a.IO.In, a.IO.Out, fmt.Sprintf("PR #%d merge를 확인했습니다. base/work를 동기화하고 안전한 local review branch를 정리하시겠습니까? [y/N] ", state.ReviewNumber))
+		ok, confirmErr := confirm(a.IO.In, a.IO.Out, fmt.Sprintf("PR #%d merge를 확인했습니다. base fast-forward, squash reconcile, work sync, review branch 정리를 진행하시겠습니까? [y/N] ", state.ReviewNumber))
 		if confirmErr != nil {
 			return confirmErr
 		}
@@ -323,26 +324,67 @@ func (a *Application) reviewFinish(ctx context.Context, g globalOptions, o revie
 			return nil
 		}
 	}
-	syncGlobal := g
-	syncGlobal.yes = true
-	if e := a.gitSyncWithOptions(ctx, syncGlobal, syncOptions{}); e != nil {
-		return clierror.Wrap(clierror.Code(e), e, "PR #%d is merged but repository sync did not finish", state.ReviewNumber)
+	managedBranch, _ := s.IsKitCreatedBranch(ctx, state.Branch)
+	reconciled := reviewReconcileResult{}
+	if state.Stage != reviewstate.StageSynced {
+		syncGlobal := g
+		syncGlobal.yes = true
+		if e := a.gitSyncWithOptions(ctx, syncGlobal, syncOptions{baseOnly: true}); e != nil {
+			return clierror.Wrap(clierror.Code(e), e, "PR #%d is merged but base fast-forward did not finish", state.ReviewNumber)
+		}
+		reconciled, e = reconcileMergedReviewQueue(ctx, s, c, state)
+		if e != nil {
+			return clierror.Wrap(clierror.Conflict, e, "PR #%d merged, but squash reconcile did not finish", state.ReviewNumber)
+		}
+		if e := a.gitSyncWithOptions(ctx, syncGlobal, syncOptions{}); e != nil {
+			return clierror.Wrap(clierror.Code(e), e, "PR #%d is merged but final repository sync did not finish", state.ReviewNumber)
+		}
+		now := time.Now().UTC()
+		state.Stage = reviewstate.StageSynced
+		state.SyncedAt = &now
+		if e := reviewstate.Save(ctx, s, state); e != nil {
+			return clierror.Wrap(clierror.Failure, e, "sync completed but review state could not be checkpointed")
+		}
+		state, _ = reviewstate.Load(ctx, s, state.Branch)
+	} else {
+		reconciled, e = reconcileMergedReviewQueue(ctx, s, c, state)
+		if e != nil {
+			return clierror.Wrap(clierror.Conflict, e, "retry review reconcile failed")
+		}
 	}
-	now := time.Now().UTC()
-	state.Stage = reviewstate.StageSynced
-	state.SyncedAt = &now
-	exists, existsErr := s.LocalBranchExists(ctx, state.Branch)
-	if existsErr != nil {
-		return clierror.Wrap(clierror.Failure, existsErr, "sync completed but review branch cleanup state could not be verified")
+
+	localRemoved, remoteRemoved, e := cleanupFinishedReviewBranch(ctx, s, c, state, managedBranch)
+	if e != nil {
+		return clierror.Wrap(clierror.Conflict, e, "PR #%d merged and work synced, but review branch cleanup did not finish", state.ReviewNumber)
 	}
-	if !exists {
+	if managedBranch {
+		now := time.Now().UTC()
 		state.Stage = reviewstate.StageCleaned
 		state.CleanedAt = &now
 	}
 	if e := reviewstate.Save(ctx, s, state); e != nil {
-		return clierror.Wrap(clierror.Failure, e, "sync completed but review state could not be finalized")
+		return clierror.Wrap(clierror.Failure, e, "review work completed but review state could not be finalized")
 	}
-	return a.printReviewStates(g, "review finish", []reviewstate.State{state}, true)
+	if e := a.printReviewStates(g, "review finish", []reviewstate.State{state}, true); e != nil {
+		return e
+	}
+	r := a.renderer(g)
+	if reconciled.Dropped > 0 {
+		r.Success("Reconcile", fmt.Sprintf("review에 포함된 work commit %d개 제거", reconciled.Dropped))
+		if reconciled.BackupBranch != "" {
+			r.Field("Backup", reconciled.BackupBranch)
+		}
+	}
+	if localRemoved {
+		r.Success("Cleanup", "local review branch 제거")
+	}
+	if remoteRemoved {
+		r.Success("Cleanup", "remote review branch 제거")
+	}
+	if !managedBranch {
+		r.Warning("Cleanup", "Kit-created branch marker가 없어 review branch는 보존했습니다")
+	}
+	return nil
 }
 
 func (a *Application) deprecatedReviewNoop(g globalOptions, command string) error {
@@ -405,7 +447,13 @@ func savePublishedReview(ctx context.Context, s gitservice.Service, c gitservice
 	}
 	hashes := make([]string, 0, len(commits))
 	for _, commit := range commits {
-		hashes = append(hashes, commit.Hash)
+		hash := commit.Hash
+		if original, ok, sourceErr := s.CherryPickedFrom(ctx, commit.Hash); sourceErr != nil {
+			return reviewstate.State{}, sourceErr
+		} else if ok {
+			hash = original
+		}
+		hashes = append(hashes, strings.ToLower(hash))
 	}
 	publishedTip := item.SourceSHA
 	if publishedTip == "" {
@@ -636,5 +684,5 @@ func isProtectedReviewBranch(b string, c gitservice.WorkflowConfig) bool {
 }
 
 func printReviewHelp(w io.Writer) {
-	fmt.Fprint(w, "Usage: kit review <command>\n\nCommands:\n  submit [options]    Push the current branch and create or reuse a Gitea PR\n  status [branch]     Refresh and show the saved PR state when supported\n  wait [branch]       Deprecated no-op; use status instead\n  finish [branch]     Verify merge, sync work, and finalize local cleanup\n  list                List locally saved review states\n")
+	fmt.Fprint(w, "Usage: kit review <command>\n\nCommands:\n  submit [options]    Push the current branch and create or reuse a Gitea PR\n  status [branch]     Refresh and show the saved PR state when supported\n  wait [branch]       Deprecated no-op; use status instead\n  finish [branch]     Verify merge, reconcile work, and clean managed review branches\n  list                List locally saved review states\n")
 }
