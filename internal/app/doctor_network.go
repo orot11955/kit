@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"kit/internal/clierror"
-	gitservice "kit/internal/git"
 	"kit/internal/hosting"
 	"kit/internal/review"
 )
