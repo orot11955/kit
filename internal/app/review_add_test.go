@@ -37,8 +37,8 @@ func TestReviewAddAppendsPendingCommitAndRestoresCheckout(t *testing.T) {
 	}}
 	var output bytes.Buffer
 	app := &Application{
-		IO:    IO{In: strings.NewReader(""), Out: &output, ErrOut: &output},
-		Build: buildinfo.Current(),
+		IO:           IO{In: strings.NewReader(""), Out: &output, ErrOut: &output},
+		Build:        buildinfo.Current(),
 		ReviewClient: func(hosting.Repository) (review.Client, error) { return client, nil },
 	}
 	if err := app.Run(context.Background(), []string{"review", "add", "feat/review", "--commit", second[:8], "--yes", "--cwd", dir}); err != nil {
@@ -81,8 +81,8 @@ func TestReviewAddConflictRollsBackEntireAddition(t *testing.T) {
 	}}
 	var output bytes.Buffer
 	app := &Application{
-		IO:    IO{In: strings.NewReader(""), Out: &output, ErrOut: &output},
-		Build: buildinfo.Current(),
+		IO:           IO{In: strings.NewReader(""), Out: &output, ErrOut: &output},
+		Build:        buildinfo.Current(),
 		ReviewClient: func(hosting.Repository) (review.Client, error) { return client, nil },
 	}
 	err := app.Run(context.Background(), []string{"review", "add", "feat/review", "--commit", second[:8], "--yes", "--cwd", dir})
