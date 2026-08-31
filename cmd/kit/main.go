@@ -20,7 +20,7 @@ func main() {
 	defer stop()
 
 	application := app.New(os.Stdin, os.Stdout, os.Stderr)
-	err := application.Run(ctx, os.Args[1:])
+	err := application.RunCLI(ctx, os.Args[1:])
 	if err == nil {
 		return
 	}
