@@ -27,6 +27,8 @@ func (a *Application) RunCLI(ctx context.Context, args []string) error {
 Additional developer tools:
   worktree      Manage linked Git worktrees
   branch-clean  Dry-run and clean safe Kit-created local review branches
+  port          Inspect or signal processes bound to a local port
+  process       Inspect or signal a local process
 
 Additional diagnostics/options:
   doctor --recovery       Inspect interrupted operations and recovery refs
@@ -36,7 +38,7 @@ Additional diagnostics/options:
 		return nil
 	}
 
-	extended := command == "worktree" || command == "branch-clean" ||
+	extended := command == "worktree" || command == "branch-clean" || command == "port" || command == "process" ||
 		(command == "review" && isExtendedReviewCommand(global, rest)) ||
 		(command == "doctor" && isRecoveryDoctorCommand(rest))
 	if !extended {
@@ -53,6 +55,10 @@ Additional diagnostics/options:
 		return a.worktreeCommand(extendedCtx, global, rest)
 	case "branch-clean":
 		return a.branchCleanCommand(extendedCtx, global, rest)
+	case "port":
+		return a.portCommand(extendedCtx, global, rest)
+	case "process":
+		return a.processCommand(extendedCtx, global, rest)
 	case "doctor":
 		return a.doctorRecoveryCommand(extendedCtx, global, rest)
 	case "review":
