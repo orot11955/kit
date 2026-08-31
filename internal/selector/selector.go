@@ -9,6 +9,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
 
@@ -147,6 +148,27 @@ type Terminal struct {
 	Out *os.File
 }
 
+type terminalKeyKind uint8
+
+const (
+	terminalKeyUnknown terminalKeyKind = iota
+	terminalKeyInterrupt
+	terminalKeyEscape
+	terminalKeyUp
+	terminalKeyDown
+	terminalKeyEnter
+	terminalKeySpace
+	terminalKeyBackspace
+	terminalKeyText
+)
+
+const escapeSequenceWaitMS = 50
+
+type terminalKey struct {
+	kind terminalKeyKind
+	text string
+}
+
 func (t Terminal) Select(items []Item, title string) ([]Item, error) {
 	if t.In == nil || t.Out == nil || !term.IsTerminal(int(t.In.Fd())) || !term.IsTerminal(int(t.Out.Fd())) {
 		return nil, ErrNotTTY
@@ -162,58 +184,166 @@ func (t Terminal) Select(items []Item, title string) ([]Item, error) {
 	}()
 
 	model := NewModel(items)
-	buffer := make([]byte, 64)
 	for {
 		render(t.Out, model, title)
-		n, readErr := t.In.Read(buffer)
+		key, readErr := readTerminalKey(t.In)
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) {
 				return nil, ErrCanceled
 			}
 			return nil, readErr
 		}
-		key := buffer[:n]
-		switch {
-		case len(key) == 1 && key[0] == 3:
+		switch key.kind {
+		case terminalKeyInterrupt:
 			return nil, ErrInterrupted
-		case len(key) == 1 && key[0] == 27:
+		case terminalKeyEscape:
 			return nil, ErrCanceled
-		case string(key) == "\x1b[A":
+		case terminalKeyUp:
 			model.Move(-1)
-		case string(key) == "\x1b[B":
+		case terminalKeyDown:
 			model.Move(1)
-		case len(key) == 1 && (key[0] == '\r' || key[0] == '\n'):
+		case terminalKeyEnter:
 			return model.Selected(), nil
-		case len(key) == 1 && key[0] == ' ':
+		case terminalKeySpace:
 			model.Toggle()
-		case len(key) == 1 && (key[0] == 127 || key[0] == 8):
+		case terminalKeyBackspace:
 			model.Backspace()
-		case len(key) == 1 && model.Query() == "" && key[0] == 'j':
-			model.Move(1)
-		case len(key) == 1 && model.Query() == "" && key[0] == 'k':
-			model.Move(-1)
-		default:
-			if text := printable(key); text != "" {
-				model.Append(text)
+		case terminalKeyText:
+			if model.Query() == "" && key.text == "j" {
+				model.Move(1)
+			} else if model.Query() == "" && key.text == "k" {
+				model.Move(-1)
+			} else {
+				model.Append(key.text)
 			}
 		}
 	}
 }
 
-func printable(value []byte) string {
-	var result strings.Builder
-	for len(value) > 0 {
-		r, size := utf8.DecodeRune(value)
-		if r == utf8.RuneError && size == 1 {
-			value = value[1:]
+func readTerminalKey(input *os.File) (terminalKey, error) {
+	first, err := readByte(input)
+	if err != nil {
+		return terminalKey{}, err
+	}
+	switch first {
+	case 3:
+		return terminalKey{kind: terminalKeyInterrupt}, nil
+	case 27:
+		return readEscapeKey(input)
+	case '\r', '\n':
+		return terminalKey{kind: terminalKeyEnter}, nil
+	case ' ':
+		return terminalKey{kind: terminalKeySpace}, nil
+	case 127, 8:
+		return terminalKey{kind: terminalKeyBackspace}, nil
+	}
+	if first >= 0x20 && first < utf8.RuneSelf {
+		return terminalKey{kind: terminalKeyText, text: string([]byte{first})}, nil
+	}
+
+	length := utf8SequenceLength(first)
+	if length == 0 {
+		return terminalKey{kind: terminalKeyUnknown}, nil
+	}
+	value := make([]byte, length)
+	value[0] = first
+	for i := 1; i < length; i++ {
+		value[i], err = readByte(input)
+		if err != nil {
+			return terminalKey{}, err
+		}
+	}
+	r, size := utf8.DecodeRune(value)
+	if size != len(value) || (r == utf8.RuneError && size == 1) || r < 0x20 || r == 0x7f {
+		return terminalKey{kind: terminalKeyUnknown}, nil
+	}
+	return terminalKey{kind: terminalKeyText, text: string(r)}, nil
+}
+
+func readEscapeKey(input *os.File) (terminalKey, error) {
+	ready, err := waitForTerminalInput(input)
+	if err != nil {
+		return terminalKey{}, err
+	}
+	if !ready {
+		return terminalKey{kind: terminalKeyEscape}, nil
+	}
+	second, err := readByte(input)
+	if errors.Is(err, io.EOF) {
+		return terminalKey{kind: terminalKeyEscape}, nil
+	}
+	if err != nil {
+		return terminalKey{}, err
+	}
+	if second != '[' && second != 'O' {
+		return terminalKey{kind: terminalKeyUnknown}, nil
+	}
+	ready, err = waitForTerminalInput(input)
+	if err != nil {
+		return terminalKey{}, err
+	}
+	if !ready {
+		return terminalKey{kind: terminalKeyUnknown}, nil
+	}
+	third, err := readByte(input)
+	if err != nil {
+		return terminalKey{}, err
+	}
+	switch third {
+	case 'A':
+		return terminalKey{kind: terminalKeyUp}, nil
+	case 'B':
+		return terminalKey{kind: terminalKeyDown}, nil
+	default:
+		return terminalKey{kind: terminalKeyUnknown}, nil
+	}
+}
+
+func waitForTerminalInput(input *os.File) (bool, error) {
+	poll := []unix.PollFd{{Fd: int32(input.Fd()), Events: unix.POLLIN}}
+	for {
+		count, err := unix.Poll(poll, escapeSequenceWaitMS)
+		if errors.Is(err, unix.EINTR) {
 			continue
 		}
-		if r >= 0x20 && r != 0x7f {
-			result.WriteRune(r)
+		if err != nil {
+			return false, fmt.Errorf("poll terminal input: %w", err)
 		}
-		value = value[size:]
+		if count == 0 {
+			return false, nil
+		}
+		events := poll[0].Revents
+		if events&unix.POLLNVAL != 0 {
+			return false, errors.New("terminal input descriptor is invalid")
+		}
+		return events&(unix.POLLIN|unix.POLLHUP|unix.POLLERR) != 0, nil
 	}
-	return result.String()
+}
+
+func readByte(input *os.File) (byte, error) {
+	var value [1]byte
+	for {
+		n, err := input.Read(value[:])
+		if n == 1 {
+			return value[0], nil
+		}
+		if err != nil {
+			return 0, err
+		}
+	}
+}
+
+func utf8SequenceLength(first byte) int {
+	switch {
+	case first >= 0xc2 && first <= 0xdf:
+		return 2
+	case first >= 0xe0 && first <= 0xef:
+		return 3
+	case first >= 0xf0 && first <= 0xf4:
+		return 4
+	default:
+		return 0
+	}
 }
 
 func render(out *os.File, model *Model, title string) {

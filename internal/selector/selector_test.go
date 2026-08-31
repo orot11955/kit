@@ -44,6 +44,63 @@ func TestModelBackspaceAndWrap(t *testing.T) {
 	}
 }
 
+func TestReadTerminalKeyArrowSequence(t *testing.T) {
+	input, output, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	defer output.Close()
+	if _, err := output.Write([]byte("\x1b[A")); err != nil {
+		t.Fatal(err)
+	}
+	key, err := readTerminalKey(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key.kind != terminalKeyUp {
+		t.Fatalf("expected up key, got %#v", key)
+	}
+}
+
+func TestReadTerminalKeyBareEscape(t *testing.T) {
+	input, output, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	defer output.Close()
+	if _, err := output.Write([]byte{27}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := readTerminalKey(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key.kind != terminalKeyEscape {
+		t.Fatalf("expected escape key, got %#v", key)
+	}
+}
+
+func TestReadTerminalKeyPreservesUTF8(t *testing.T) {
+	input, output, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	defer output.Close()
+	if _, err := output.Write([]byte("가")); err != nil {
+		t.Fatal(err)
+	}
+	key, err := readTerminalKey(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key.kind != terminalKeyText || key.text != "가" {
+		t.Fatalf("expected UTF-8 text key, got %#v", key)
+	}
+}
+
 func TestTerminalRejectsNonTTY(t *testing.T) {
 	input, err := os.CreateTemp(t.TempDir(), "input")
 	if err != nil {
