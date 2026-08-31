@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"time"
 
 	"kit/internal/buildinfo"
@@ -211,8 +210,4 @@ func unusedTempPath(directory, pattern string) (string, error) {
 		return "", err
 	}
 	return name, nil
-}
-
-func normalizeVersion(value string) string {
-	return strings.TrimSpace(value)
 }
