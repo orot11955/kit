@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"kit/internal/buildinfo"
+	gitservice "kit/internal/git"
 	"kit/internal/hosting"
 	"kit/internal/review"
 	"kit/internal/reviewstate"
@@ -51,7 +52,7 @@ func TestReviewAddAppendsPendingCommitAndRestoresCheckout(t *testing.T) {
 	if localTip == reviewTip || remoteTip != localTip {
 		t.Fatalf("review branch was not pushed correctly: before=%s local=%s remote=%s", reviewTip, localTip, remoteTip)
 	}
-	state, err := reviewstate.Load(context.Background(), app.GitServiceForTest(dir), "feat/review")
+	state, err := reviewstate.Load(context.Background(), gitservice.Service{Dir: dir}, "feat/review")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +147,7 @@ func setupReviewAddRepository(t *testing.T, conflict bool) (dir, remote, first, 
 		gitCommand(t, dir, "add", "conflict.txt")
 		gitCommand(t, dir, "commit", "-m", "review-only conflict")
 	}
-	service := app.GitServiceForTest(dir)
+	service := gitservice.Service{Dir: dir}
 	if err := service.MarkKitCreatedBranch(context.Background(), "feat/review"); err != nil {
 		t.Fatal(err)
 	}
@@ -164,8 +165,4 @@ func setupReviewAddRepository(t *testing.T, conflict bool) (dir, remote, first, 
 	}
 	gitCommand(t, dir, "switch", "work")
 	return dir, remote, first, second, reviewTip
-}
-
-func (a *Application) GitServiceForTest(dir string) gitServiceAlias {
-	return gitServiceAlias{Dir: dir}
 }
