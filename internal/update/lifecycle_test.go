@@ -28,12 +28,12 @@ func TestRunCheckOnlyDoesNotDownloadAssetOrInspectInstallPath(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header), Request: r}, nil
 	})}
 	result, err := Run(context.Background(), Config{
-		ReleaseURL: "http://kit.test/release.json",
-		HTTPClient: client,
-		AllowHTTP:  true,
-		CheckOnly:  true,
-		Current:    buildinfo.Info{Version: "v1.2.3"},
-		Executable: filepath.Join(t.TempDir(), "missing-current"),
+		ReleaseURL:   "http://kit.test/release.json",
+		HTTPClient:   client,
+		AllowHTTP:    true,
+		CheckOnly:    true,
+		Current:      buildinfo.Info{Version: "v1.2.3"},
+		Executable:   filepath.Join(t.TempDir(), "missing-current"),
 		ExpectedPath: filepath.Join(t.TempDir(), "missing-expected"),
 	})
 	if err != nil {
