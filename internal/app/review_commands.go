@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"kit/internal/clierror"
 	gitservice "kit/internal/git"
@@ -84,6 +85,7 @@ func (a *Application) gitReview(ctx context.Context, global globalOptions, args 
 		return clierror.New(clierror.Usage, "unknown review command %q", args[0])
 	}
 }
+
 func parseReviewSubmit(global globalOptions, args []string) (reviewSubmitOptions, globalOptions, error) {
 	o := reviewSubmitOptions{removeSourceBranch: true}
 	for len(args) > 0 {
@@ -125,6 +127,7 @@ func parseReviewSubmit(global globalOptions, args []string) (reviewSubmitOptions
 	}
 	return o, global, nil
 }
+
 func parseReviewBranchCommand(global globalOptions, args []string, command string) (string, globalOptions, error) {
 	g, rest, e := parseAllGlobals(global, args)
 	if e != nil {
@@ -138,6 +141,7 @@ func parseReviewBranchCommand(global globalOptions, args []string, command strin
 	}
 	return "", g, nil
 }
+
 func parseAllGlobals(global globalOptions, args []string) (globalOptions, []string, error) {
 	r := make([]string, 0, len(args))
 	for len(args) > 0 {
@@ -212,12 +216,26 @@ func (a *Application) reviewSubmit(ctx context.Context, g globalOptions, o revie
 	if e = s.PushCurrent(ctx, c.Remote, branch, upstream == ""); e != nil {
 		return clierror.Wrap(clierror.Failure, e, "push %s", branch)
 	}
-	created, e := client.Create(ctx, review.CreateRequest{SourceBranch: branch, TargetBranch: c.Base, Title: title, Description: desc, Draft: o.draft, RemoveSourceBranch: o.removeSourceBranch})
-	if e != nil {
-		return clierror.Wrap(clierror.Failure, e, "create PR after push; local and remote branch %s were kept, so verify the PR manually before retrying", branch)
+
+	created := review.Review{}
+	reused := false
+	if finder, ok := client.(review.OpenFinder); ok {
+		created, reused, e = finder.FindOpen(ctx, branch, c.Base)
+		if e != nil {
+			return clierror.Wrap(clierror.Failure, e, "check for an existing PR after push; no new PR was attempted")
+		}
 	}
-	if created.ID == "" || created.URL == "" {
-		return clierror.New(clierror.Failure, "provider returned incomplete PR metadata; local and remote branch %s were kept, so verify the PR manually", branch)
+	if !reused {
+		created, e = client.Create(ctx, review.CreateRequest{SourceBranch: branch, TargetBranch: c.Base, Title: title, Description: desc, Draft: o.draft, RemoveSourceBranch: o.removeSourceBranch})
+		if e != nil {
+			return clierror.Wrap(clierror.Failure, e, "create PR after push; local and remote branch %s were kept, so retrying review submit is safe after checking provider status", branch)
+		}
+	}
+	if created.ID == "" || created.URL == "" || created.Number <= 0 {
+		return clierror.New(clierror.Failure, "provider returned incomplete PR metadata; local and remote branch %s were kept", branch)
+	}
+	if _, e = savePublishedReview(ctx, s, c, branch, created); e != nil {
+		return clierror.Wrap(clierror.Failure, e, "PR #%d exists but local review state could not be saved", created.Number)
 	}
 	if g.json {
 		return writeJSON(a.IO.Out, created)
@@ -227,10 +245,15 @@ func (a *Application) reviewSubmit(ctx context.Context, g globalOptions, o revie
 		r.Command("review submit")
 	}
 	r.Success("Push", c.Remote+"/"+branch)
-	r.Success("PR", created.URL)
-	r.Next("PR merge 후 kit sync")
+	if reused {
+		r.Success("PR", fmt.Sprintf("기존 #%d 재사용 · %s", created.Number, created.URL))
+	} else {
+		r.Success("PR", fmt.Sprintf("#%d · %s", created.Number, created.URL))
+	}
+	r.Next("PR merge 후 kit review finish")
 	return nil
 }
+
 func (a *Application) reviewStatus(ctx context.Context, g globalOptions, b string) error {
 	s, e := a.reviewGitService(ctx, g, nil)
 	if e != nil {
@@ -242,25 +265,96 @@ func (a *Application) reviewStatus(ctx context.Context, g globalOptions, b strin
 	}
 	state, e := reviewstate.Load(ctx, s, b)
 	if e != nil {
-		return clierror.Wrap(clierror.Failure, e, "load cached review state")
+		return clierror.Wrap(clierror.Failure, e, "load review state")
 	}
-	return a.printCachedReview(g, "review status", []reviewstate.State{state})
+	state, refreshed, e := a.refreshReviewState(ctx, s, state)
+	if e != nil {
+		return clierror.Wrap(clierror.Failure, e, "refresh PR #%d", state.ReviewNumber)
+	}
+	return a.printReviewStates(g, "review status", []reviewstate.State{state}, refreshed)
 }
+
 func (a *Application) reviewWait(_ context.Context, g globalOptions, _ reviewWaitOptions) error {
 	return a.deprecatedReviewNoop(g, "wait")
 }
-func (a *Application) reviewFinish(_ context.Context, g globalOptions, _ reviewFinishOptions) error {
-	return a.deprecatedReviewNoop(g, "finish")
+
+func (a *Application) reviewFinish(ctx context.Context, g globalOptions, o reviewFinishOptions) error {
+	if g.json {
+		return clierror.New(clierror.Usage, "review finish does not support --json yet; use review status --json and kit sync --yes --json for automation")
+	}
+	s, e := a.reviewGitService(ctx, g, nil)
+	if e != nil {
+		return e
+	}
+	branch, e := resolveReviewBranch(ctx, s, o.branch)
+	if e != nil {
+		return e
+	}
+	state, e := reviewstate.Load(ctx, s, branch)
+	if e != nil {
+		return clierror.Wrap(clierror.Failure, e, "load review state")
+	}
+	state, refreshed, e := a.refreshReviewState(ctx, s, state)
+	if e != nil {
+		return clierror.Wrap(clierror.Failure, e, "refresh PR #%d", state.ReviewNumber)
+	}
+	if !refreshed {
+		return clierror.New(clierror.Failure, "provider %q cannot refresh this cached review; verify the merge manually and run kit sync", state.Provider)
+	}
+	if state.Stage == reviewstate.StageCleaned {
+		return a.printReviewStates(g, "review finish", []reviewstate.State{state}, true)
+	}
+	switch state.Status {
+	case review.StatusOpen:
+		return clierror.New(clierror.Conflict, "PR #%d is still open: %s", state.ReviewNumber, state.ReviewURL)
+	case review.StatusClosed:
+		return clierror.New(clierror.Failure, "PR #%d was closed without merge: %s", state.ReviewNumber, state.ReviewURL)
+	case review.StatusMerged:
+	default:
+		return clierror.New(clierror.Failure, "PR #%d has unknown status %q", state.ReviewNumber, state.Status)
+	}
+	if !g.yes {
+		ok, confirmErr := confirm(a.IO.In, a.IO.Out, fmt.Sprintf("PR #%d merge를 확인했습니다. base/work를 동기화하고 안전한 local review branch를 정리하시겠습니까? [y/N] ", state.ReviewNumber))
+		if confirmErr != nil {
+			return confirmErr
+		}
+		if !ok {
+			fmt.Fprintln(a.IO.Out, "취소되었습니다.")
+			return nil
+		}
+	}
+	syncGlobal := g
+	syncGlobal.yes = true
+	if e := a.gitSyncWithOptions(ctx, syncGlobal, syncOptions{}); e != nil {
+		return clierror.Wrap(clierror.Code(e), e, "PR #%d is merged but repository sync did not finish", state.ReviewNumber)
+	}
+	now := time.Now().UTC()
+	state.Stage = reviewstate.StageSynced
+	state.SyncedAt = &now
+	exists, existsErr := s.LocalBranchExists(ctx, state.Branch)
+	if existsErr != nil {
+		return clierror.Wrap(clierror.Failure, existsErr, "sync completed but review branch cleanup state could not be verified")
+	}
+	if !exists {
+		state.Stage = reviewstate.StageCleaned
+		state.CleanedAt = &now
+	}
+	if e := reviewstate.Save(ctx, s, state); e != nil {
+		return clierror.Wrap(clierror.Failure, e, "sync completed but review state could not be finalized")
+	}
+	return a.printReviewStates(g, "review finish", []reviewstate.State{state}, true)
 }
+
 func (a *Application) deprecatedReviewNoop(g globalOptions, command string) error {
 	if g.json {
-		return writeJSON(a.IO.Out, map[string]any{"deprecated": true, "command": "review " + command, "next": "kit sync"})
+		return writeJSON(a.IO.Out, map[string]any{"deprecated": true, "command": "review " + command, "next": "kit review status"})
 	}
 	r := a.renderer(g)
 	r.Notice("호환 명령")
-	r.Warning("kit review "+command, "더 이상 provider를 조회하거나 Git을 변경하지 않습니다. PR이 머지된 뒤 kit sync를 실행하세요.")
+	r.Warning("kit review "+command, "더 이상 대기하지 않습니다. 현재 상태는 'kit review status'로 확인하고 merge 후 'kit review finish'를 실행하세요.")
 	return nil
 }
+
 func (a *Application) reviewList(ctx context.Context, g globalOptions) error {
 	s, e := a.reviewGitService(ctx, g, nil)
 	if e != nil {
@@ -270,30 +364,148 @@ func (a *Application) reviewList(ctx context.Context, g globalOptions) error {
 	if e != nil {
 		return clierror.Wrap(clierror.Failure, e, "list review states")
 	}
-	return a.printCachedReview(g, "review list", states)
+	return a.printReviewStates(g, "review list", states, false)
 }
-func (a *Application) printCachedReview(g globalOptions, command string, states []reviewstate.State) error {
+
+func (a *Application) printReviewStates(g globalOptions, command string, states []reviewstate.State, refreshed bool) error {
 	if g.json {
 		return writeJSON(a.IO.Out, states)
 	}
 	r := a.renderer(g)
 	r.Command(command)
-	r.Section("캐시된 레거시 리뷰")
+	r.Section("리뷰 상태")
 	if len(states) == 0 {
 		r.Field("State", "저장된 리뷰 상태가 없습니다.")
 		return nil
 	}
-	for _, s := range states {
-		r.Field("Review", fmt.Sprintf("%s → %s · %s", s.Branch, s.TargetBranch, reviewStageLabel(s.Stage)))
+	for _, state := range states {
+		value := fmt.Sprintf("%s → %s · %s", state.Branch, state.TargetBranch, reviewStageLabel(state.Stage))
+		if state.ReviewNumber > 0 {
+			value = fmt.Sprintf("%s → %s · #%d · %s", state.Branch, state.TargetBranch, state.ReviewNumber, reviewStageLabel(state.Stage))
+		}
+		r.Field("Review", value)
+		if state.ReviewURL != "" {
+			r.Field("URL", state.ReviewURL)
+		}
+	}
+	if refreshed {
+		r.Success("Provider", "현재 상태로 갱신")
 	}
 	return nil
 }
+
+func savePublishedReview(ctx context.Context, s gitservice.Service, c gitservice.WorkflowConfig, branch string, item review.Review) (reviewstate.State, error) {
+	tip, e := s.RevisionHash(ctx, branch)
+	if e != nil {
+		return reviewstate.State{}, e
+	}
+	commits, e := s.Candidates(ctx, c.Base, branch, true)
+	if e != nil {
+		return reviewstate.State{}, e
+	}
+	hashes := make([]string, 0, len(commits))
+	for _, commit := range commits {
+		hashes = append(hashes, commit.Hash)
+	}
+	publishedTip := item.SourceSHA
+	if publishedTip == "" {
+		publishedTip = tip
+	}
+	state := reviewstate.State{
+		Stage:         reviewStage(item.Status),
+		Provider:      item.Provider,
+		Remote:        c.Remote,
+		Branch:        branch,
+		SourceBranch:  c.Source,
+		TargetBranch:  c.Base,
+		SourceCommits: hashes,
+		ReviewID:      item.ID,
+		ReviewNumber:  item.Number,
+		ReviewURL:     item.URL,
+		Status:        item.Status,
+		PickedTip:     tip,
+		PublishedTip:  publishedTip,
+		MergeSHA:      item.MergeSHA,
+		MergedAt:      item.MergedAt,
+	}
+	if previous, loadErr := reviewstate.Load(ctx, s, branch); loadErr == nil {
+		state.CreatedAt = previous.CreatedAt
+		if previous.PickedTip != "" {
+			state.PickedTip = previous.PickedTip
+		}
+	}
+	if e := reviewstate.Save(ctx, s, state); e != nil {
+		return reviewstate.State{}, e
+	}
+	return reviewstate.Load(ctx, s, branch)
+}
+
+func (a *Application) refreshReviewState(ctx context.Context, s gitservice.Service, state reviewstate.State) (reviewstate.State, bool, error) {
+	if state.ReviewNumber <= 0 {
+		return state, false, nil
+	}
+	c := s.WorkflowConfig(ctx)
+	repo, e := reviewRepository(ctx, s, c)
+	if e != nil {
+		return state, false, e
+	}
+	if state.Provider != "" && repo.Provider != state.Provider {
+		return state, false, fmt.Errorf("configured provider %q does not match saved review provider %q", repo.Provider, state.Provider)
+	}
+	warnInsecureHTTP(ctx, a.IO.ErrOut, repo)
+	client, e := a.ReviewClient(repo)
+	if e != nil {
+		return state, false, e
+	}
+	getter, ok := client.(review.Getter)
+	if !ok {
+		return state, false, nil
+	}
+	item, e := getter.Get(ctx, state.ReviewNumber)
+	if e != nil {
+		return state, true, e
+	}
+	if item.SourceBranch != state.Branch || item.TargetBranch != state.TargetBranch {
+		return state, true, fmt.Errorf("provider review branches changed: got %s → %s, expected %s → %s", item.SourceBranch, item.TargetBranch, state.Branch, state.TargetBranch)
+	}
+	state.Provider = item.Provider
+	state.ReviewID = item.ID
+	state.ReviewNumber = item.Number
+	state.ReviewURL = item.URL
+	state.Status = item.Status
+	if item.SourceSHA != "" {
+		state.PublishedTip = item.SourceSHA
+	}
+	state.MergeSHA = item.MergeSHA
+	state.MergedAt = item.MergedAt
+	if !(item.Status == review.StatusMerged && (state.Stage == reviewstate.StageSynced || state.Stage == reviewstate.StageCleaned)) {
+		state.Stage = reviewStage(item.Status)
+	}
+	if e := reviewstate.Save(ctx, s, state); e != nil {
+		return state, true, e
+	}
+	updated, e := reviewstate.Load(ctx, s, state.Branch)
+	return updated, true, e
+}
+
+func reviewStage(status review.Status) reviewstate.Stage {
+	switch status {
+	case review.StatusMerged:
+		return reviewstate.StageMerged
+	case review.StatusClosed:
+		return reviewstate.StageClosed
+	default:
+		return reviewstate.StageOpen
+	}
+}
+
 func (a *Application) reviewGitService(ctx context.Context, g globalOptions, o *gitservice.Service) (gitservice.Service, error) {
 	if o != nil {
 		return *o, nil
 	}
 	return a.validatedGit(ctx, g.cwd)
 }
+
 func reviewRepository(ctx context.Context, s gitservice.Service, c gitservice.WorkflowConfig) (hosting.Repository, error) {
 	u, e := s.RemoteURL(ctx, c.Remote)
 	if e != nil {
@@ -306,6 +518,7 @@ func reviewRepository(ctx context.Context, s gitservice.Service, c gitservice.Wo
 	}
 	return r, nil
 }
+
 func warnInsecureHTTP(ctx context.Context, w io.Writer, r hosting.Repository) {
 	if !r.InsecureHTTPAllowed() {
 		return
@@ -332,14 +545,21 @@ func resolveReviewBranch(ctx context.Context, s gitservice.Service, b string) (s
 	if e != nil {
 		return "", clierror.Wrap(clierror.Failure, e, "list review states")
 	}
-	if len(states) == 1 {
-		return states[0].Branch, nil
+	active := make([]reviewstate.State, 0, len(states))
+	for _, state := range states {
+		if state.Stage != reviewstate.StageCleaned {
+			active = append(active, state)
+		}
 	}
-	if len(states) == 0 {
-		return "", clierror.New(clierror.Failure, "no cached review state was found")
+	if len(active) == 1 {
+		return active[0].Branch, nil
 	}
-	return "", clierror.New(clierror.Usage, "multiple cached reviews exist; specify a branch")
+	if len(active) == 0 {
+		return "", clierror.New(clierror.Failure, "no active review state was found")
+	}
+	return "", clierror.New(clierror.Usage, "multiple active reviews exist; specify a branch")
 }
+
 func (a *Application) reviewText(ctx context.Context, s gitservice.Service, target, branch string, o reviewSubmitOptions) (string, string, error) {
 	commits, e := s.Candidates(ctx, target, branch, true)
 	if e != nil {
@@ -374,6 +594,7 @@ func (a *Application) reviewText(ctx context.Context, s gitservice.Service, targ
 	}
 	return title, d, nil
 }
+
 func readReviewDescription(p string) ([]byte, error) {
 	i, e := os.Lstat(p)
 	if e != nil {
@@ -409,9 +630,11 @@ func readReviewDescription(p string) ([]byte, error) {
 	}
 	return data, nil
 }
+
 func isProtectedReviewBranch(b string, c gitservice.WorkflowConfig) bool {
 	return b == c.Stable || b == c.Base || b == c.Source
 }
+
 func printReviewHelp(w io.Writer) {
-	fmt.Fprint(w, "Usage: kit review <command>\n\nCommands:\n  submit [options]    Push the current branch and create a PR\n  status [branch]     Show cached legacy review state\n  wait [branch]       Deprecated no-op; run sync after merge\n  finish [branch]     Deprecated no-op; run sync after merge\n  list                List cached legacy review states\n")
+	fmt.Fprint(w, "Usage: kit review <command>\n\nCommands:\n  submit [options]    Push the current branch and create or reuse a Gitea PR\n  status [branch]     Refresh and show the saved PR state when supported\n  wait [branch]       Deprecated no-op; use status instead\n  finish [branch]     Verify merge, sync work, and finalize local cleanup\n  list                List locally saved review states\n")
 }

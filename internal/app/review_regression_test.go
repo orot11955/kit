@@ -14,11 +14,16 @@ import (
 	"kit/internal/hosting"
 	"kit/internal/pickstate"
 	"kit/internal/review"
+	"kit/internal/reviewstate"
 )
 
 type recordingReviewClient struct {
-	calls int
-	err   error
+	calls     int
+	findCalls int
+	getCalls  int
+	err       error
+	existing  review.Review
+	current   review.Review
 }
 
 func (c *recordingReviewClient) Create(_ context.Context, request review.CreateRequest) (review.Review, error) {
@@ -26,7 +31,32 @@ func (c *recordingReviewClient) Create(_ context.Context, request review.CreateR
 	if c.err != nil {
 		return review.Review{}, c.err
 	}
-	return review.Review{ID: "1", URL: "https://gitea.example/org/repo/pulls/1", SourceBranch: request.SourceBranch, TargetBranch: request.TargetBranch}, nil
+	return review.Review{
+		Provider: "gitea", ID: "1", Number: 1, URL: "https://gitea.example/org/repo/pulls/1",
+		Status: review.StatusOpen, SourceBranch: request.SourceBranch, TargetBranch: request.TargetBranch, Title: request.Title,
+	}, nil
+}
+
+func (c *recordingReviewClient) FindOpen(_ context.Context, sourceBranch, targetBranch string) (review.Review, bool, error) {
+	c.findCalls++
+	if c.existing.Number == 0 {
+		return review.Review{}, false, nil
+	}
+	if c.existing.SourceBranch != sourceBranch || c.existing.TargetBranch != targetBranch {
+		return review.Review{}, false, nil
+	}
+	return c.existing, true, nil
+}
+
+func (c *recordingReviewClient) Get(_ context.Context, number int64) (review.Review, error) {
+	c.getCalls++
+	if c.current.Number != 0 {
+		return c.current, nil
+	}
+	return review.Review{
+		Provider: "gitea", ID: "1", Number: number, URL: "https://gitea.example/org/repo/pulls/1",
+		Status: review.StatusOpen, SourceBranch: "feat/review", TargetBranch: "develop", Title: "review title",
+	}, nil
 }
 
 func TestReviewSubmitCreateReturnsImmediatelyAndKeepsBranchOnFailure(t *testing.T) {
@@ -59,36 +89,127 @@ func TestReviewSubmitCreateReturnsImmediatelyAndKeepsBranchOnFailure(t *testing.
 			if test.err == nil && err != nil {
 				t.Fatal(err)
 			}
-			if test.err != nil && (err == nil || !strings.Contains(err.Error(), "verify the PR manually")) {
-				t.Fatalf("expected retained-branch guidance, got %v", err)
+			if test.err != nil && (err == nil || !strings.Contains(err.Error(), "retrying review submit is safe")) {
+				t.Fatalf("expected retry-safe guidance, got %v", err)
 			}
-			if client.calls != 1 {
-				t.Fatalf("Create calls=%d, want 1", client.calls)
+			if client.calls != 1 || client.findCalls != 1 {
+				t.Fatalf("calls: FindOpen=%d Create=%d, want 1/1", client.findCalls, client.calls)
 			}
 			if !commandSucceeds(dir, "show-ref", "--verify", "--quiet", "refs/heads/feat/review") {
 				t.Fatal("review branch was removed after Create result")
+			}
+			if test.err == nil {
+				state, stateErr := reviewstate.Load(context.Background(), gitservice.Service{Dir: dir}, "feat/review")
+				if stateErr != nil || state.Stage != reviewstate.StageOpen || state.ReviewNumber != 1 {
+					t.Fatalf("review state was not saved: %#v err=%v", state, stateErr)
+				}
 			}
 		})
 	}
 }
 
-func TestDeprecatedReviewWaitAndFinishDoNotInitializeGitOrProvider(t *testing.T) {
-	for _, command := range []string{"wait", "finish"} {
-		t.Run(command, func(t *testing.T) {
-			app := &Application{
-				IO:    IO{In: strings.NewReader(""), Out: &bytes.Buffer{}, ErrOut: &bytes.Buffer{}},
-				Build: buildinfo.Current(),
-				Git: func(string) gitservice.Service {
-					panic("Git must not be initialized by deprecated review command")
-				},
-				ReviewClient: func(hosting.Repository) (review.Client, error) {
-					panic("provider must not be initialized by deprecated review command")
-				},
-			}
-			if err := app.Run(context.Background(), []string{"review", command, "--json"}); err != nil {
-				t.Fatal(err)
-			}
-		})
+func TestReviewSubmitReusesExistingOpenPR(t *testing.T) {
+	dir := appRepository(t)
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	gitCommand(t, "", "init", "--bare", remote)
+	gitCommand(t, dir, "remote", "add", "origin", remote)
+	gitCommand(t, dir, "switch", "-c", "feat/review")
+	if err := os.WriteFile(filepath.Join(dir, "review.txt"), []byte("review\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, dir, "add", "review.txt")
+	gitCommand(t, dir, "commit", "-m", "review title")
+
+	client := &recordingReviewClient{existing: review.Review{
+		Provider: "gitea", ID: "9", Number: 9, URL: "https://gitea.example/org/repo/pulls/9",
+		Status: review.StatusOpen, SourceBranch: "feat/review", TargetBranch: "develop", Title: "review title",
+	}}
+	app := &Application{
+		IO: IO{In: strings.NewReader(""), Out: &bytes.Buffer{}, ErrOut: &bytes.Buffer{}}, Build: buildinfo.Current(),
+		ReviewClient: func(hosting.Repository) (review.Client, error) { return client, nil },
+	}
+	if err := app.Run(context.Background(), []string{"review", "submit", "--cwd", dir, "--yes"}); err != nil {
+		t.Fatal(err)
+	}
+	if client.findCalls != 1 || client.calls != 0 {
+		t.Fatalf("existing PR was not reused: FindOpen=%d Create=%d", client.findCalls, client.calls)
+	}
+	state, err := reviewstate.Load(context.Background(), gitservice.Service{Dir: dir}, "feat/review")
+	if err != nil || state.ReviewNumber != 9 {
+		t.Fatalf("reused PR state was not saved: %#v err=%v", state, err)
+	}
+}
+
+func TestReviewStatusRefreshesSavedGiteaState(t *testing.T) {
+	dir := appRepository(t)
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	gitCommand(t, "", "init", "--bare", remote)
+	gitCommand(t, dir, "remote", "add", "origin", remote)
+	gitCommand(t, dir, "switch", "-c", "feat/review")
+	if err := os.WriteFile(filepath.Join(dir, "review.txt"), []byte("review\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, dir, "add", "review.txt")
+	gitCommand(t, dir, "commit", "-m", "review title")
+	client := &recordingReviewClient{}
+	app := &Application{
+		IO: IO{In: strings.NewReader(""), Out: &bytes.Buffer{}, ErrOut: &bytes.Buffer{}}, Build: buildinfo.Current(),
+		ReviewClient: func(hosting.Repository) (review.Client, error) { return client, nil },
+	}
+	if err := app.Run(context.Background(), []string{"review", "submit", "--cwd", dir, "--yes"}); err != nil {
+		t.Fatal(err)
+	}
+	client.current = review.Review{
+		Provider: "gitea", ID: "1", Number: 1, URL: "https://gitea.example/org/repo/pulls/1",
+		Status: review.StatusMerged, SourceBranch: "feat/review", TargetBranch: "develop", Title: "review title", MergeSHA: "merged-sha",
+	}
+	if err := app.Run(context.Background(), []string{"review", "status", "feat/review", "--cwd", dir, "--json"}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := reviewstate.Load(context.Background(), gitservice.Service{Dir: dir}, "feat/review")
+	if err != nil || state.Stage != reviewstate.StageMerged || state.Status != review.StatusMerged || state.MergeSHA != "merged-sha" {
+		t.Fatalf("review state was not refreshed: %#v err=%v", state, err)
+	}
+}
+
+func TestReviewFinishRejectsOpenPRBeforeSync(t *testing.T) {
+	dir := appRepository(t)
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	gitCommand(t, "", "init", "--bare", remote)
+	gitCommand(t, dir, "remote", "add", "origin", remote)
+	gitCommand(t, dir, "switch", "-c", "feat/review")
+	if err := os.WriteFile(filepath.Join(dir, "review.txt"), []byte("review\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, dir, "add", "review.txt")
+	gitCommand(t, dir, "commit", "-m", "review title")
+	client := &recordingReviewClient{}
+	app := &Application{
+		IO: IO{In: strings.NewReader(""), Out: &bytes.Buffer{}, ErrOut: &bytes.Buffer{}}, Build: buildinfo.Current(),
+		ReviewClient: func(hosting.Repository) (review.Client, error) { return client, nil },
+	}
+	if err := app.Run(context.Background(), []string{"review", "submit", "--cwd", dir, "--yes"}); err != nil {
+		t.Fatal(err)
+	}
+	err := app.Run(context.Background(), []string{"review", "finish", "feat/review", "--cwd", dir, "--yes"})
+	if err == nil || !strings.Contains(err.Error(), "still open") {
+		t.Fatalf("expected open-PR rejection, got %v", err)
+	}
+}
+
+func TestDeprecatedReviewWaitDoesNotInitializeGitOrProvider(t *testing.T) {
+	app := &Application{
+		IO:    IO{In: strings.NewReader(""), Out: &bytes.Buffer{}, ErrOut: &bytes.Buffer{}},
+		Build: buildinfo.Current(),
+		Git: func(string) gitservice.Service {
+			panic("Git must not be initialized by deprecated review wait")
+		},
+		ReviewClient: func(hosting.Repository) (review.Client, error) {
+			panic("provider must not be initialized by deprecated review wait")
+		},
+	}
+	if err := app.Run(context.Background(), []string{"review", "wait", "--json"}); err != nil {
+		t.Fatal(err)
 	}
 }
 

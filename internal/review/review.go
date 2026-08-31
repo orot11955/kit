@@ -52,6 +52,18 @@ type Client interface {
 	Create(ctx context.Context, request CreateRequest) (Review, error)
 }
 
+// OpenFinder is an optional provider capability used to make review submission
+// idempotent after a branch has already been pushed.
+type OpenFinder interface {
+	FindOpen(ctx context.Context, sourceBranch, targetBranch string) (Review, bool, error)
+}
+
+// Getter is an optional provider capability used to refresh a previously
+// created review by its repository-local number.
+type Getter interface {
+	Get(ctx context.Context, number int64) (Review, error)
+}
+
 type Options struct {
 	// HTTPClient is primarily intended for tests with an httptest TLS server.
 	// Timeout and redirect restrictions are applied to a copy of this client.

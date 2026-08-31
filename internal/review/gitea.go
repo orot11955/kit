@@ -2,6 +2,7 @@ package review
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -58,7 +59,51 @@ func (c *giteaClient) Create(ctx context.Context, request CreateRequest) (Review
 	if err := c.doJSON(ctx, http.MethodPost, c.pullsEndpoint(), payload, &response, "Authorization"); err != nil {
 		return Review{}, err
 	}
-	mapped := mapGiteaReview(response)
+	return c.mapAndValidate(response)
+}
+
+func (c *giteaClient) FindOpen(ctx context.Context, sourceBranch, targetBranch string) (Review, bool, error) {
+	if strings.TrimSpace(sourceBranch) == "" || strings.TrimSpace(targetBranch) == "" {
+		return Review{}, false, errors.New("source and target branch are required")
+	}
+	query := url.Values{}
+	query.Set("state", "open")
+	query.Set("limit", "50")
+	var response []giteaReview
+	if err := c.doJSON(ctx, http.MethodGet, c.pullsEndpoint()+"?"+query.Encode(), nil, &response, "Authorization"); err != nil {
+		return Review{}, false, err
+	}
+	var found Review
+	for _, item := range response {
+		mapped, err := c.mapAndValidate(item)
+		if err != nil {
+			return Review{}, false, err
+		}
+		if mapped.Status != StatusOpen || mapped.SourceBranch != sourceBranch || mapped.TargetBranch != targetBranch {
+			continue
+		}
+		if found.Number != 0 {
+			return Review{}, false, errors.New("multiple open Gitea pull requests match the same source and target branches")
+		}
+		found = mapped
+	}
+	return found, found.Number != 0, nil
+}
+
+func (c *giteaClient) Get(ctx context.Context, number int64) (Review, error) {
+	if number <= 0 {
+		return Review{}, errors.New("review number must be positive")
+	}
+	var response giteaReview
+	endpoint := c.pullsEndpoint() + "/" + strconv.FormatInt(number, 10)
+	if err := c.doJSON(ctx, http.MethodGet, endpoint, nil, &response, "Authorization"); err != nil {
+		return Review{}, err
+	}
+	return c.mapAndValidate(response)
+}
+
+func (c *giteaClient) mapAndValidate(item giteaReview) (Review, error) {
+	mapped := mapGiteaReview(item)
 	if err := c.validateReview(mapped); err != nil {
 		return Review{}, err
 	}
@@ -104,3 +149,5 @@ func giteaBranchName(branch giteaRef) string {
 }
 
 var _ Client = (*giteaClient)(nil)
+var _ OpenFinder = (*giteaClient)(nil)
+var _ Getter = (*giteaClient)(nil)
