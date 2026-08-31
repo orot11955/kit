@@ -87,8 +87,8 @@ func Listeners(ctx context.Context, runner Runner, port int) ([]Listener, error)
 
 	var result []Listener
 	for _, query := range [][]string{
-		{"-nP", "-a", "-iTCP:" + strconv.Itoa(port), "-sTCP:LISTEN", "-FpcLPn"},
-		{"-nP", "-a", "-iUDP:" + strconv.Itoa(port), "-FpcLPn"},
+		{"-nP", "-iTCP:" + strconv.Itoa(port), "-sTCP:LISTEN", "-FpcLPn"},
+		{"-nP", "-iUDP:" + strconv.Itoa(port), "-FpcLPn"},
 	} {
 		out, err := runner.Run(ctx, "lsof", query...)
 		if err != nil {
@@ -219,12 +219,22 @@ func ParseSignal(value string) (syscall.Signal, string, error) {
 	}
 }
 
-func Signal(pid int, signal syscall.Signal) error {
+func ValidateTarget(pid int) error {
 	if pid <= 1 {
 		return fmt.Errorf("refusing to signal protected PID %d", pid)
 	}
 	if pid == os.Getpid() {
 		return errors.New("refusing to signal the current kit process")
+	}
+	if err := syscall.Kill(pid, 0); err != nil {
+		return fmt.Errorf("process %d is unavailable or cannot be signaled: %w", pid, err)
+	}
+	return nil
+}
+
+func Signal(pid int, signal syscall.Signal) error {
+	if err := ValidateTarget(pid); err != nil {
+		return err
 	}
 	process, err := os.FindProcess(pid)
 	if err != nil {
