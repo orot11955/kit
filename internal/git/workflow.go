@@ -157,11 +157,14 @@ func (s Service) RemoteURL(ctx context.Context, remote string) (string, error) {
 }
 
 func (s Service) Upstream(ctx context.Context) (string, error) {
-	out, err := s.run(ctx, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+	_, branch, err := s.Head(ctx)
 	if err != nil {
+		return "", err
+	}
+	if branch == "" {
 		return "", nil
 	}
-	return strings.TrimSpace(string(out)), nil
+	return s.UpstreamForBranch(ctx, branch)
 }
 
 func (s Service) UpstreamForBranch(ctx context.Context, branch string) (string, error) {

@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -54,6 +55,11 @@ func configKey(name string) (string, error) {
 }
 
 func (s Service) WorkflowConfig(ctx context.Context) WorkflowConfig {
+	config, _ := s.WorkflowConfigStrict(ctx)
+	return config
+}
+
+func (s Service) WorkflowConfigStrict(ctx context.Context) (WorkflowConfig, error) {
 	config := DefaultWorkflowConfig()
 	for name, target := range map[string]*string{
 		"git.provider": &config.Provider,
@@ -62,14 +68,24 @@ func (s Service) WorkflowConfig(ctx context.Context) WorkflowConfig {
 		"git.base":     &config.Base,
 		"git.source":   &config.Source,
 	} {
-		if value, err := s.ConfigGet(ctx, name); err == nil && value != "" {
+		value, err := s.ConfigGet(ctx, name)
+		if errors.Is(err, ErrConfigNotSet) {
+			continue
+		}
+		if err != nil {
+			return config, fmt.Errorf("read repository config %q: %w", name, err)
+		}
+		if value != "" {
 			*target = value
 		}
 	}
-	if value, err := s.ConfigGet(ctx, "git.allow-insecure-http"); err == nil {
+	value, err := s.ConfigGet(ctx, "git.allow-insecure-http")
+	if err == nil {
 		config.AllowInsecureHTTP = value == "true"
+	} else if !errors.Is(err, ErrConfigNotSet) {
+		return config, fmt.Errorf("read repository config %q: %w", "git.allow-insecure-http", err)
 	}
-	return config
+	return config, nil
 }
 
 func (s Service) ConfigGet(ctx context.Context, name string) (string, error) {
@@ -79,7 +95,10 @@ func (s Service) ConfigGet(ctx context.Context, name string) (string, error) {
 	}
 	out, err := s.run(ctx, "config", "--local", "--get", key)
 	if err != nil {
-		return "", fmt.Errorf("repository config %q is not set", name)
+		if IsExitCode(err, 1) {
+			return "", fmt.Errorf("%w: %q", ErrConfigNotSet, name)
+		}
+		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
 }
@@ -150,7 +169,7 @@ func (s Service) IsKitCreatedBranch(ctx context.Context, branch string) (bool, e
 	}
 	branches, err := s.KitCreatedBranches(ctx)
 	if err != nil {
-		return false, nil
+		return false, err
 	}
 	for _, marked := range branches {
 		if marked == branch {
@@ -168,9 +187,8 @@ func (s Service) ClearKitCreatedBranch(ctx context.Context, branch string) error
 	// marker must not remain merely because it is no longer trusted for cleanup.
 	_, err := s.run(ctx, "config", "--local", "--unset-all", "branch."+branch+".kitCreated")
 	if err != nil {
-		// git config uses a non-zero status when the key is already absent. That
-		// is the desired postcondition for rollback and branch deletion.
-		if strings.Contains(err.Error(), "exit status 5") {
+		// Missing config is the desired postcondition for rollback and branch deletion.
+		if IsExitCode(err, 1) || IsExitCode(err, 5) {
 			return nil
 		}
 		return err
@@ -183,7 +201,10 @@ func (s Service) ClearKitCreatedBranch(ctx context.Context, branch string) error
 func (s Service) KitCreatedBranches(ctx context.Context) ([]string, error) {
 	out, err := s.run(ctx, "config", "--local", "--get-regexp", "^branch\\..*\\.kitcreated$")
 	if err != nil {
-		return nil, nil
+		if IsExitCode(err, 1) {
+			return nil, nil
+		}
+		return nil, err
 	}
 	const prefix = "branch."
 	const suffix = ".kitcreated"
@@ -215,7 +236,10 @@ func (s Service) KitCreatedBranches(ctx context.Context) ([]string, error) {
 }
 
 func (s Service) InitializeWorkflowConfig(ctx context.Context) (WorkflowConfig, error) {
-	config := s.WorkflowConfig(ctx)
+	config, err := s.WorkflowConfigStrict(ctx)
+	if err != nil {
+		return WorkflowConfig{}, err
+	}
 	values := map[string]string{
 		"git.provider":            config.Provider,
 		"git.remote":              config.Remote,
