@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"strings"
 
@@ -14,7 +15,21 @@ import (
 func (a *Application) RunCLI(ctx context.Context, args []string) error {
 	extendedCtx, stripped, verbose := stripVerboseFlag(ctx, args)
 	global, command, rest, err := parseRoot(stripped)
-	if err != nil || (command != "worktree" && command != "branch-clean") {
+	if err != nil {
+		return a.Run(ctx, args)
+	}
+	if command == "" || command == "help" {
+		if err := a.Run(ctx, args); err != nil {
+			return err
+		}
+		fmt.Fprint(a.IO.Out, `
+Additional developer tools:
+  worktree      Manage linked Git worktrees
+  branch-clean  Dry-run and clean safe Kit-created local review branches
+`)
+		return nil
+	}
+	if command != "worktree" && command != "branch-clean" {
 		return a.Run(ctx, args)
 	}
 	if a.IO.In == nil {
