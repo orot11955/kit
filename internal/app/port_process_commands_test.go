@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"net"
 	"os"
 	"os/exec"
@@ -114,9 +113,5 @@ func TestPortKillRejectsCurrentProcessBeforeMutation(t *testing.T) {
 	err = a.RunCLI(context.Background(), []string{"port", "kill", strconv.Itoa(port), "--yes"})
 	if err == nil || clierror.Code(err) != clierror.Conflict {
 		t.Fatalf("expected protected-process conflict, got %v", err)
-	}
-	if !errors.Is(listener.SetDeadline(time.Now().Add(time.Millisecond)), nil) {
-		// net.TCPListener has no generic health probe; reaching this point without
-		// process termination is the meaningful safety assertion.
 	}
 }
