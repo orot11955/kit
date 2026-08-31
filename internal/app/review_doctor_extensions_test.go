@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -178,7 +177,6 @@ func TestDoctorRecoveryFindsInterruptedStateAndRefs(t *testing.T) {
 	if doctorHasFailedCheck(result.Checks, "backup refs") {
 		t.Fatalf("normal backup refs must not fail recovery doctor: %#v", result.Checks)
 	}
-	_ = os.Remove(filepathJoinForTest(t, dir, ".never"))
 }
 
 func doctorHasFailedCheck(checks []doctorCheck, name string) bool {
@@ -188,9 +186,4 @@ func doctorHasFailedCheck(checks []doctorCheck, name string) bool {
 		}
 	}
 	return false
-}
-
-func filepathJoinForTest(t *testing.T, parts ...string) string {
-	t.Helper()
-	return strings.Join(parts, string(os.PathSeparator))
 }
