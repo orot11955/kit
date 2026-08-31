@@ -8,29 +8,6 @@ import (
 	"strings"
 )
 
-// RemoteBranchHash reads one remote branch without updating local or
-// remote-tracking refs. The bool result reports whether the branch exists.
-func (s Service) RemoteBranchHash(ctx context.Context, remote, branch string) (string, bool, error) {
-	if strings.TrimSpace(remote) == "" || strings.HasPrefix(remote, "-") {
-		return "", false, fmt.Errorf("invalid remote %q", remote)
-	}
-	if err := s.ValidateBranchName(ctx, branch); err != nil {
-		return "", false, err
-	}
-	out, err := s.run(ctx, "ls-remote", "--heads", remote, "refs/heads/"+branch)
-	if err != nil {
-		return "", false, err
-	}
-	fields := strings.Fields(string(out))
-	if len(fields) == 0 {
-		return "", false, nil
-	}
-	if len(fields) != 2 || fields[1] != "refs/heads/"+branch || len(fields[0]) != 40 {
-		return "", false, fmt.Errorf("unexpected ls-remote response for %s/%s", remote, branch)
-	}
-	return strings.ToLower(fields[0]), true, nil
-}
-
 // TraceRunner reports Git invocations without printing stdin or known token
 // values. It is intended for --verbose diagnostics and preserves the wrapped
 // runner's behavior.
