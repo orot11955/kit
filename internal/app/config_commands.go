@@ -21,6 +21,7 @@ func (a *Application) configCommand(ctx context.Context, global globalOptions, a
 
 Repository-local commands:
   init                 Write the default Git workflow settings
+  bootstrap            Initialize config and missing local workflow branches from the remote
   list                 Show the resolved Git workflow settings
   get <key>            Read one setting
   set <key> <value>    Write one setting
@@ -65,6 +66,32 @@ Keys:
 			return clierror.Wrap(clierror.Failure, err, "initialize repository config")
 		}
 		return a.printWorkflowConfig(config, global.json)
+	case "bootstrap":
+		if len(filtered) != 0 {
+			return clierror.New(clierror.Usage, "config bootstrap accepts no arguments")
+		}
+		config, err := service.InitializeWorkflowConfig(ctx)
+		if err != nil {
+			return clierror.Wrap(clierror.Failure, err, "initialize repository config")
+		}
+		result, err := bootstrapWorkflow(ctx, service, config)
+		if err != nil {
+			return err
+		}
+		if global.json {
+			return writeJSON(a.IO.Out, result)
+		}
+		renderer := a.renderer(global)
+		renderer.Command("config bootstrap")
+		renderer.Success("Remote", config.Remote+" fetched")
+		for _, branch := range result.Created {
+			renderer.Success("Created", branch)
+		}
+		for _, branch := range result.Existing {
+			renderer.Field("Existing", branch)
+		}
+		renderer.Next("kit doctor")
+		return nil
 	case "list":
 		if len(filtered) != 0 {
 			return clierror.New(clierror.Usage, "config list accepts no arguments")
@@ -111,6 +138,70 @@ func (a *Application) printWorkflowConfig(config gitservice.WorkflowConfig, json
 	}
 	fmt.Fprintf(a.IO.Out, "git.provider=%s\ngit.remote=%s\ngit.stable=%s\ngit.base=%s\ngit.source=%s\ngit.allow-insecure-http=%t\n", config.Provider, config.Remote, config.Stable, config.Base, config.Source, config.AllowInsecureHTTP)
 	return nil
+}
+
+type bootstrapResult struct {
+	Config   gitservice.WorkflowConfig `json:"config"`
+	Created  []string                  `json:"created"`
+	Existing []string                  `json:"existing"`
+}
+
+func bootstrapWorkflow(ctx context.Context, service gitservice.Service, config gitservice.WorkflowConfig) (bootstrapResult, error) {
+	result := bootstrapResult{Config: config, Created: []string{}, Existing: []string{}}
+	if config.Stable == config.Base || config.Stable == config.Source || config.Base == config.Source {
+		return result, clierror.New(clierror.Conflict, "stable, base, and source branches must use distinct names")
+	}
+	if err := service.Fetch(ctx, config.Remote); err != nil {
+		return result, clierror.Wrap(clierror.Failure, err, "fetch %s", config.Remote)
+	}
+
+	for _, branch := range []string{config.Stable, config.Base} {
+		remoteRef := config.Remote + "/" + branch
+		if err := service.VerifyRevision(ctx, remoteRef); err != nil {
+			return result, clierror.Wrap(clierror.Failure, err, "remote workflow branch %q was not found", remoteRef)
+		}
+		exists, err := service.LocalBranchExists(ctx, branch)
+		if err != nil {
+			return result, clierror.Wrap(clierror.Failure, err, "check local branch %q", branch)
+		}
+		if exists {
+			result.Existing = append(result.Existing, branch)
+			continue
+		}
+		if err := service.CreateBranchAt(ctx, branch, remoteRef); err != nil {
+			return result, clierror.Wrap(clierror.Failure, err, "create local %s from %s", branch, remoteRef)
+		}
+		result.Created = append(result.Created, branch)
+	}
+
+	remoteSource, err := service.RemoteTrackingBranchExists(ctx, config.Remote, config.Source)
+	if err != nil {
+		return result, clierror.Wrap(clierror.Failure, err, "check remote source branch")
+	}
+	if remoteSource {
+		return result, clierror.New(clierror.Conflict, "%s/%s exists, but the configured source branch is a local-only queue; rename or remove the remote branch before bootstrap", config.Remote, config.Source)
+	}
+
+	sourceExists, err := service.LocalBranchExists(ctx, config.Source)
+	if err != nil {
+		return result, clierror.Wrap(clierror.Failure, err, "check local source branch %q", config.Source)
+	}
+	if !sourceExists {
+		if err := service.CreateBranchAt(ctx, config.Source, config.Base); err != nil {
+			return result, clierror.Wrap(clierror.Failure, err, "create local source branch %q", config.Source)
+		}
+		result.Created = append(result.Created, config.Source)
+		return result, nil
+	}
+	result.Existing = append(result.Existing, config.Source)
+	synced, err := service.IsAncestor(ctx, config.Base, config.Source)
+	if err != nil {
+		return result, clierror.Wrap(clierror.Failure, err, "check existing source branch")
+	}
+	if !synced {
+		return result, clierror.New(clierror.Conflict, "existing source branch %s does not contain %s; run kit sync instead of overwriting it", config.Source, config.Base)
+	}
+	return result, nil
 }
 
 type doctorResult struct {
