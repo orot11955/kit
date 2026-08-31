@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -353,5 +352,3 @@ Options:
   --no-color       Disable ANSI colors
 `)
 }
-
-var _ = os.Getpid
