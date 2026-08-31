@@ -1,927 +1,440 @@
-# kit — 개발 및 배포 계획
+# kit — 현재 Architecture와 Safety Contract
 
-> macOS Apple Silicon과 Ubuntu에서 자주 쓰는 shell 명령을 하나의 Go CLI로 편하게 실행한다.
+이 문서는 `kit`의 현재 구현을 설명한다. 초기 roadmap나 미래 후보가 아니라 지금 코드에서 유지해야 하는 boundary와 invariant를 기준으로 한다.
 
----
+## 1. 목적
 
-# 1. 목표
-
-`kit`은 복잡한 범용 개발 환경 관리 도구가 아니다. 현재 사용 중인 shell 명령을
-Go subcommand로 옮겨 다음 문제를 해결하는 개인용 CLI다.
-
-- 여러 shell script를 따로 설치하고 이름을 기억해야 하는 문제
-- macOS와 Ubuntu에서 조금씩 다른 실행 환경
-- 새 기능을 추가할 때 argument, 출력, 오류 처리를 반복하는 문제
-- 새 기기마다 binary를 직접 빌드하거나 복사해야 하는 문제
-- 기존 설치본을 수동으로 교체해야 하는 문제
-
-목표 사용자 흐름은 단순하게 유지한다.
-
-```bash
-# 최초 설치
-curl -fsSL https://kit.2juho.com/install.sh | sh
-
-# 설치 직후 현재 shell에서 사용
-$HOME/.local/bin/kit version
-$HOME/.local/bin/kit compare
-
-# 새 terminal부터 PATH로 사용
-kit compare
-kit pick feat/login
-
-# 이후 업데이트
-kit update
-```
-
----
-
-# 2. 지원 대상
-
-공식 지원 target은 다음 두 개다.
-
-| OS | Architecture | Go target |
-|---|---|---|
-| macOS | Apple Silicon | `darwin/arm64` |
-| Ubuntu 24.04 LTS | x86-64 | `linux/amd64` |
-
-Intel Mac인 `darwin/amd64`는 빌드, 배포, 테스트 대상에서 제외한다.
-
-Ubuntu ARM64와 다른 Linux distribution은 우연히 동작할 수 있지만 build, 배포, 테스트
-대상이나 공식 지원으로 표현하지 않는다.
-
----
-
-# 3. 명령 이름
-
-기존 `hash`는 실제 동작을 설명하지 못하므로 변경하고, `pick`은 기존 사용성과 짧은
-명령 이름을 유지한다.
-
-| 기존 이름 | 새 이름 | 이유 |
-|---|---|---|
-| `ghash`, `kit hash` | `kit compare` | hash 생성이 아니라 source와 base 브랜치의 커밋 반영 상태를 비교하는 명령이기 때문 |
-| `gpick` | `kit pick` | 기존 이름을 유지하면서 `kit` namespace 아래로 통합 |
-
-`kit hash`는 checksum 또는 Git object hash 조회로 오해할 수 있으므로 제공하지 않는다.
-`kit pick`은 source의 미반영 commit을 선택하여 새 branch에 적용하는 기존 `gpick`
-workflow로 의미를 고정한다.
-
-## 3.1 `kit compare`
-
-`work`와 같은 source 브랜치의 커밋이 `develop`과 같은 base 브랜치에 반영됐는지
-확인하는 read-only 명령이다.
-
-반영 여부는 다음 두 방법으로 판단한다.
-
-1. `git cherry-pick -x`가 기록한 원본 commit hash
-2. 동일 변경을 찾기 위한 stable patch-id
-
-기본 사용:
-
-```bash
-kit compare
-kit compare work
-kit compare work --base develop
-kit compare work --base main --limit 10
-```
-
-기본값:
+`kit`은 범용 Git hosting CLI가 아니다. 다음 local workflow를 반복 가능하고 복구 가능하게 만드는 개인용 Go CLI다.
 
 ```text
-source = work
-base   = develop
+main     stable / release 기준
+develop  integration base
+work     local-only commit queue
+feat/*   일회성 review branch
 ```
 
-출력은 반영 완료와 미반영 commit을 구분한다. compare는 Git 기록만 비교하며 provider API나
-기존 review metadata를 조회하지 않는다. metadata는 legacy 진단 기록으로 남지만 후보를 예약하거나
-자동으로 삭제하지 않는다.
+권장 흐름:
 
 ```text
-STAT  HASH      DATE              MESSAGE
-✓     329ab12f  2026-08-14 10:30  applied commit
-●     a137bc91  2026-08-14 11:20  pending commit
+compare → pick → Gitea review/merge → review finish
 ```
 
-## 3.2 `kit pick`
+`sync`는 provider lifecycle과 독립적인 Git-only queue 동기화 명령으로 유지한다.
 
-source 브랜치의 미반영 commit을 대화형으로 선택하고, base에서 새 브랜치를 만든 뒤
-선택한 commit을 source history의 위상 순서대로 `git cherry-pick -x`한다. review branch를
-push하고 Gitea PR을 생성하면 즉시 반환한다.
+## 2. 공식 지원 target
 
-```bash
-kit pick feat/login
-kit pick chore/refactor --all
-kit pick feat/local --local
-```
+| OS | Architecture | Go target | CI |
+|---|---|---|---|
+| macOS | Apple Silicon | `darwin/arm64` | GitHub `macos-15` native runtime |
+| Ubuntu 24.04 | x86-64 | `linux/amd64` | GitHub `ubuntu-24.04` |
 
-첫 번째 positional argument는 새로 만들 branch다. 이를 commit hash로 해석하지 않는다.
+macOS CI는 `go env GOOS=darwin`, `GOARCH=arm64`, `uname -m=arm64`를 확인한 뒤 Go test/native build/실행을 수행한다.
+
+## 3. 주요 package boundary
 
 ```text
-source의 미반영 commit 조회
-  → 사용자 선택
-  → 실행 내용 확인
-  → base에서 새 branch 생성
-  → git cherry-pick -x
-  → push · Gitea PR 생성
-  → 즉시 반환
+cmd/kit
+  └─ process entrypoint / signal / exit code
+
+internal/app
+  ├─ CLI parsing and orchestration
+  ├─ compare / pick / sync / review
+  ├─ config / auth / doctor / update
+  ├─ worktree / branch-clean extensions
+  └─ user-facing rendering and mutation confirmation
+
+internal/git
+  ├─ system Git command execution
+  ├─ branch/ref/config helpers
+  ├─ applied detection
+  ├─ worktree / cleanup helpers
+  ├─ backup/recovery naming
+  └─ sanitized tracing / typed command errors
+
+internal/workflow
+  └─ complex Git-only sync/rebuild/recovery algorithm
+
+internal/review
+  ├─ Gitea API adapter
+  ├─ compatibility GitLab/Forgejo mapping
+  ├─ secure HTTP client
+  └─ review create/find/get/ping contracts
+
+internal/reviewstate
+  └─ local persisted provider/review lifecycle state
+
+internal/pickstate
+  └─ interrupted pick continuation checkpoint
+
+internal/auth
+  └─ Gitea credential storage and profile metadata
+
+internal/update
+  └─ release metadata, download verification, install/rollback
 ```
 
-Gitea의 PR Create 요청이 실패하거나 불완전한 metadata를 반환하면 local/remote branch는 보존한다.
-재시도 전에 Gitea에서 PR 생성 여부를 수동으로 확인해야 한다. `--local`은 review branch를 로컬에만
-생성하는 고급 경로다.
+`Application.Run`의 기존 contract는 유지하고, 이후 추가된 developer command/option은 `RunCLI` extension router를 사용한다. 이는 이미 큰 orchestration 파일을 더 키우지 않으면서 기존 embedding/test contract를 보존하기 위한 구조다.
 
-working tree가 dirty하거나 대상 branch가 이미 있으면 아무것도 변경하지 않고 실패한다.
-conflict가 발생하면 다음 Git 동작을 제공한다.
+## 4. Git execution boundary
+
+runtime Git 작업은 shell string interpolation이 아니라 `exec.CommandContext("git", args...)` 형태로 수행한다.
+
+보안/진단 contract:
+
+- `KIT_*_TOKEN`은 Git child environment에서 제거
+- HTTPS URL credential redaction
+- `token`, `password`, `access_token`, `private_token` query redaction
+- command argument에 있던 secret을 stderr가 되풀이해도 추가 redaction
+- Git failure는 typed `CommandError`로 sanitized args와 exit code를 보존
+- expected absence와 command failure를 exit code로 구분
+
+`--verbose`는 sanitized Git command/API diagnostic 단계만 stderr에 출력한다. request body나 credential은 출력하지 않는다.
+
+## 5. Workflow configuration
+
+repository-local 기본값:
 
 ```text
-continue → git cherry-pick --continue
-skip     → git cherry-pick --skip
-abort    → git cherry-pick --abort
+git.provider = gitea
+git.remote   = origin
+git.stable   = main
+git.base     = develop
+git.source   = work
 ```
 
-commit timestamp만으로 순서를 정렬하지 않는다. timestamp는 임의로 수정될 수 있고
-commit dependency 순서를 보장하지 않기 때문이다. source revision walk에서 얻은 순서를
-역순으로 적용하여 부모 쪽 commit부터 처리한다.
+`kit config init`은 설정을 기록한다.
 
-commit 선택은 Go binary에 포함된 full-screen fuzzy multi-select UI를 사용한다. 외부
-`fzf` executable은 요구하지 않으며 설치 직후 `kit pick`을 사용할 수 있어야 한다.
-`--all`은 selector를 열지 않고 미반영 commit 전체를 기존 위상 순서대로 선택한다.
-대량 refactoring처럼 후보가 많은 경우에도 최종 실행 확인과 기존 rollback 계약은 그대로 유지한다.
-Go TUI library는 build dependency로 고정하여 최종 binary에 포함한다.
+`kit config bootstrap`은 새 clone bootstrap을 담당한다.
 
-기본 key 계약:
+- remote fetch
+- remote stable/base 존재 확인
+- missing local stable/base 생성
+- missing source를 base에서 생성
+- existing source는 덮어쓰지 않음
+- remote source 존재 시 local-only queue 계약 위반으로 중단
+
+config missing은 `ErrConfigNotSet`으로 실제 Git failure와 구분한다.
+
+## 6. Pending/applied 판정
+
+source queue commit이 base에 반영됐는지는 다음 순서로 판단한다.
+
+1. base commit message의 `cherry picked from commit <sha>` (`git cherry-pick -x`)
+2. stable patch-id
+
+성능 contract:
+
+- 모든 candidate가 `-x`로 확인되면 patch scan 생략
+- base patch history는 `git log ... -p | git patch-id --stable` streaming pipeline
+- candidate patch는 하나의 batch `git show`와 patch-id call로 계산
+
+`compare`, 일반 `sync`는 provider metadata를 사용하지 않는다.
+
+## 7. Pick transaction
+
+`kit pick <branch>`는:
+
+1. clean tree 확인
+2. remote/base/source freshness 확인
+3. pending commit 계산
+4. interactive / `--all` / repeated `--commit` selection
+5. source의 original pending order로 normalize
+6. pick state 저장
+7. base에서 target branch 생성 + Kit-created marker
+8. commit별 `cherry-pick -x`
+9. push
+10. Gitea PR create-or-reuse
+11. reviewstate 저장
+
+`--dry-run`은 branch/ref를 변경하지 않는다.
+
+noninteractive JSON mutation은 `--yes`가 필요하다.
+
+conflict 발생 시 pickstate를 남기며:
 
 ```text
-문자 입력       fuzzy 검색
-↑ / ↓, j / k   cursor 이동
-space           선택 / 해제
-enter           선택 확정
-esc             취소
-ctrl+c          interrupt (exit 130)
-```
-
-TTY가 아니면 full-screen UI를 시작하지 않고 명확한 오류를 반환한다. 자동화용 commit 지정
-방식은 실제 필요가 생기면 별도 flag로 추가한다.
-
-## 3.3 협업 Git workflow
-
-branch 역할은 다음으로 고정한다.
-
-```text
-main     안정 version과 release tag 기준
-develop  여러 개발자의 review branch가 합쳐지는 통합 branch
-work     원격에 push하지 않는 local commit queue
-feat/*   develop에서 만들어 Gitea PR로 올리는 일회성 branch
-```
-
-일상 흐름은 `kit compare`, `kit pick <branch>`, `kit sync` 세 단계다.
-
-```text
-kit compare  →  남은 work 커밋 확인
-kit pick     →  선택 · push · Gitea PR 생성 후 반환
-Gitea merge  →  kit sync로 local Git queue 동기화
-```
-
-`compare`, `status`, `sync`는 provider API를 호출하지 않는다. 기존 review metadata는 읽기 전용
-legacy 기록이다. `status`, `review`, `backup`은 상세 진단·복구를 위한 고급 경로이며, `kit git ...`와 `kit self ...` namespace는 기존
-사용자와 자동화를 위해 호환 유지한다.
-
-다른 개발자의 merge로 `develop`이 바뀌면 `kit sync`는 `origin/develop`을 fast-forward한 뒤,
-기존 work를 backup branch로 보존하고 최신 develop에서 work를 재구성한다. 재적용 대상은 work의
-direct first-parent 일반 pending commit뿐이며, merge commit과 side-parent commit은 제외한다.
-재구성 실패 시 기존 work,
-원 checkout과 이번 실행 전 develop hash를 복원하고 모두 검증한다. 검증에 성공한 경우 그
-실패 실행에서 생성한 자동 backup을 삭제하며, 복원 또는 삭제를 검증하지 못하면 backup을
-남기고 정확한 이름을 오류에 포함한다. 재적용 충돌은 임시 branch에서 해결하며
-`[c] continue`, `[s] skip`,
-`[a] abort` 중 하나를 선택한다. continue 전에 충돌 파일을 수정하고 `git add`해야 한다.
-외부 IDE에서 해결 commit까지 만든 경우에는 변경된 임시 branch HEAD를 감지해 continue로
-처리한다.
-외부 해결 commit 이후 다음 충돌이나 오류로 재구성이 중단되면 임시 HEAD를
-`kit/recovery/*` branch로 보존한 뒤 원래 `work`와 checkout을 복원한다.
-skip한 commit은 결과의 `skipped`로 표시되고 backup에는 남는다. 성공한 sync 뒤에도 원본 work backup은
-복구용으로 남는다. 전체 적용이 끝나기 전에는 `work` branch를 이동하지 않는다.
-
-고급·복구 명령은 다음처럼 구분한다.
-
-```bash
-# 상세 상태와 cached legacy review metadata 확인
-kit status
-
-# legacy metadata와 backup 복구
-kit review list
-kit backup list
-kit backup restore <backup-branch>
-kit backup cleanup --dry-run
-kit backup cleanup [--all]
-```
-
-`cleanup`의 기본 대상은 현재 source branch에 대해 sync/refresh가 자동 생성한 backup이다.
-`--all`은 같은 source의 manual backup과 restore 전 safety backup까지 포함한다. 삭제 전에는
-목록과 확인을 제공하고 `--dry-run`은 아무 ref도 변경하지 않는다. `kit/recovery/*`와
-`kit/tmp/*`는 이 명령의 대상이 아니다. restore가 실패한 경우에도 source ref와 원 checkout을
-safety backup으로 복원·검증한 뒤 그 실패 실행에서 만든 safety backup만 삭제한다. 성공한
-restore의 safety backup은 명시적으로 cleanup할 때까지 유지한다.
-
-신규 backup ref는 `kit/backup/v2/<source-sha256>/<kind>/<id>` 형식으로 source 소유권과
-종류를 분리한다. 구버전의 `/`→`-` 형식은 서로 다른 source를 구분할 수 없으므로 source가
-정확히 `work`인 legacy ref만 list/restore/cleanup에서 호환한다. 다른 source의 legacy ref는
-`git branch --list 'kit/backup/*'`로 읽기 전용 확인 후 운영자가 직접 판단한다.
-
-`develop`이 `work`의 ancestor가 아니면 work는 `STALE`이다. `kit compare`는 경고와 상태를
-표시하지만 read-only로 실행한다. 기본 `kit pick`은 원격 base를 fetch하고 동기화가
-필요하면 내부적으로 안전한 동기화를 먼저 실행한다. 사용자 지정 `--from`/`--base` 흐름은
-로컬 branch 생성에만 쓰며 remote workflow 계약을 자동으로 추정하지 않는다. 장애 복구에만 `--allow-stale`을
-명시적으로 사용할 수 있다.
-
-`sync`는 최신 develop에서 work를 항상 재구성한다. work의 direct first-parent 일반 pending commit만
-다시 적용하고 merge commit과 side-parent에서만 reachable한 commit은 제외한다. 실행 전 제외 범위를
-경고하며, 성공 뒤 원본 work는 backup branch로 남아 사용자가 복원할 수 있다. side 작업은 work에 merge하지
-말고 필요한 변경을 direct commit으로 남기거나 별도 review branch로 올려 관리한다.
-
-`pick`은 commit을 하나씩 적용하고 `$(git rev-parse --git-path kit)/pick-state.json`에
-진행 상태를 저장한다. process가 끝나도 다음 명령으로 이어갈 수 있다.
-
-```bash
 kit pick --continue
 kit pick --skip
 kit pick --abort
 ```
 
-continue는 임의로 `git add -A`하지 않는다. 사용자가 해결한 파일을 직접 stage해야 한다.
+으로 process 종료 이후에도 재개할 수 있다.
 
-## 3.4 Git hosting provider
+push 시작 전 review initialization이 실패하면 original checkout으로 rollback하고 생성 branch/marker/state를 제거한다. push 시작 후에는 remote 결과가 불확실할 수 있으므로 local/remote branch를 보존한다.
 
-local Git workflow는 server에 종속되지 않는다. 회사·협업 repository와 개인 repository,
-kit 배포는 모두 Gitea를 사용한다. provider별 차이는 hosting adapter가 PR API 계약으로
-흡수한다.
+## 8. Review lifecycle
 
-```bash
-kit config init
-kit config set git.provider gitea
-```
+reviewstate는 다음을 저장한다.
 
-repository local 설정은 `.git/config`의 `kit.git.*` key를 사용한다.
-신규 repository의 기본 provider는 `gitea`다. `gitlab`·`forgejo` 값은 전환 중인 기존
-설정을 읽고 같은 값으로 보존하는 경우에만 허용하며 새로 설정할 수 없다.
+- provider / remote
+- source review branch / target base
+- PR number / URL / status
+- original source commit hashes
+- picked/published tip
+- merge SHA / timestamps
+- lifecycle stage
 
-```text
-git.provider = auto | gitea | generic
-git.remote   = origin
-git.stable   = main
-git.base     = develop
-git.source   = work
-git.allow-insecure-http = false | true
-```
+### submit
 
-`git.allow-insecure-http`의 기본값은 `false`다. `true`여도 remote URL에 `http://`가
-명시되어 있고 host가 RFC1918, loopback 또는 link-local literal IP인 Gitea에만 적용한다.
-DNS hostname, public IP, SSH/scp remote에는 적용하지 않으며 remote scheme을 보고 자동으로
-downgrade하지 않는다. redirect와 API가 반환한 review URL도 최초 scheme과 `host[:port]`가
-정확히 같아야 한다. HTTP를 사용하는 모든 review command는 token이 평문 전송된다는 경고를
-stderr에 출력한다.
+`review submit`은 push 후 동일 source/base의 open PR을 먼저 찾는다. 존재하면 재사용하고 없으면 create한다. 따라서 API timeout 후 재실행이 idempotent한 방향으로 동작한다.
 
-HTTP review URL은 기존 schema 1 state에 저장되지만 HTTPS-only 구버전 kit는 해당 state를
-읽지 못한다. binary를 downgrade하기 전에는 진행 중인 HTTP review를 finish/cleaned 상태로
-정리하거나 `.git/kit/reviews/`를 별도로 백업한다. 설정을 unset하거나 `false`로 바꾸면 새
-API 요청은 즉시 HTTPS 기본값으로 돌아간다.
+### add
 
-`kit git publish`는 `main`, `develop`, `work` push를 차단하고 현재 review branch만 push한다.
-Gitea API token은 필요로 하지 않으며 provider에 맞는 PR 생성 주소를 출력한다.
-`kit git publish`는 기존 호환을 위해 push와 review 생성 URL 출력만 담당한다. 실제 review
-수명주기는 별도 namespace에서 관리한다.
+`review add`는 이미 열린 Kit-managed PR에 pending work commit을 추가한다.
 
-```bash
-kit review submit
-kit review status [branch]
-kit review list
-```
+반드시 검증하는 조건:
 
-`submit`은 현재 branch를 push한 뒤 Gitea PR Create 요청을 한 번 수행하고 즉시 반환한다. 기존 PR을
-Find/Get으로 조회하거나 재사용하지 않는다. `kit pick`도 같은 Create-only 흐름을 수행한다. `--local`은
-push와 PR 생성 없이 local branch만 만든다. push가 시작된 뒤 PR 생성이 실패하면 원격 반영 여부를
-단정할 수 없으므로 branch와 legacy review metadata를 보존한다. Gitea에서 PR 존재 여부를 수동으로
-확인해야 한다.
+- provider PR `open`
+- Kit-created marker
+- clean tree
+- correct upstream
+- local tip == remote tip == provider source SHA == saved PublishedTip
+- base/source freshness
 
-상위 `kit sync`와 `kit status`는 provider API를 호출하지 않는다. `sync`는 Git만 사용해 base를
-fast-forward하고 work를 재구성하며, PR merge 여부나 provider branch head를 검증하지 않는다. 재구성 뒤에는
-향후 Kit-created marker가 기록된 local review branch만 후보로 삼고, branch tip이 현재 base의 ancestor인 경우에만
-non-force local 삭제한다. squash merge와 non-ancestor branch, marker가 없는 branch, stable/base/work는
-보존한다. remote branch는 삭제하지 않으며 cleanup 오류는 sync 결과의 warning일 뿐 실패가 아니다. 현재
-checkout한 후보는 upstream이 정확히 `origin/<branch>`일 때에만 work로 전환한 뒤 정리한다.
+추가 cherry-pick 중 실패하면 시작 전 branch tip으로 rollback한다. remote push 성공 후에만 state를 갱신한다.
 
-상태는 `.git/kit/reviews/<branch-sha256>.json`에 atomic write하며 token은 기록하지 않는다.
-Gitea token은 `kit auth login gitea --host <host>`로 macOS Keychain 또는 Linux Secret
-Service에 host별로 등록한다. keyring 자체가 profile을 열거하지 못하므로 kit는 token이
-없는 profile metadata만 user config directory에 보관한다. Linux keyring backend가 없는
-경우에는 명시적 동의로, macOS Keychain 장애 시에는 `--store file`을 직접 지정한 경우에만
-mode `0600` local credential file을 사용할 수 있다. macOS에서는 자동 우회하지 않으며,
-backend가 잠겼거나 권한 오류가 난 경우에도 file로 자동 우회하지 않는다. project 설정,
-Git config, review state, JSON 출력과 log에는 token을 기록하지 않는다.
+### status/list
 
-macOS에서 token lookup이 login Keychain 잠금 때문에 사용자 상호작용을 요구하면, 일반 TTY의
-`pick`/`review` 실행은 `security unlock-keychain <login.keychain>`을 password argument 없이
-한 번 호출하고 표준 macOS 비밀번호 prompt에 연결한다. 해제에 성공하면 같은 token lookup을
-한 번 재시도한다. kit는 Keychain의 lock-on-sleep, 자동 잠금 시간 또는 접근 제어를 변경하지
-않고, token을 환경 변수나 평문 file로 자동 대체하지 않는다. JSON·CI·pipe처럼 TTY가 없는
-실행은 prompt를 열 수 없으므로 사용자가 먼저 다음 명령을 대화형 terminal에서 실행해야 한다.
+`review status`는 단일 saved review를 provider에서 refresh한다.
 
-```bash
-security unlock-keychain "$HOME/Library/Keychains/login.keychain-db"
-```
+`review list --refresh`는 active saved review를 provider에서 일괄 refresh한다.
 
-`KIT_GITEA_TOKEN`과 `KIT_GITEA_HOST`는 CI/일회성 override로만 지원하며 반드시 함께
-지정한다. 환경 변수 쌍이 있으면 저장 credential보다 우선하고, 불완전한 쌍이면 실패한다.
-host는 remote의 정확한 소문자 `host[:port]`와 일치해야 한다. 기본 HTTPS 또는 명시적으로
-허용한 사설 IP HTTP origin에서 scheme이나 host가 바뀌는 redirect는 차단한다. 제품명이
-드러나지 않는 사설 hostname은 `auto`로 판별하지 않고
-`git.provider=gitea`를 요구한다.
-PR 생성에 필요한 최소 API scope는 `write:repository`다. Git push는 이 API token을 쓰지
-않고 기존 SSH key 또는 Git credential helper를 사용한다.
-기존 `gitlab`·`forgejo` 설정과 schema 1 review state는 전환 중인 작업을 진단하고 복구할
-수 있도록 호환 읽기와 기존 adapter를 유지하지만 신규 설정에는 사용하지 않는다.
-Gitea create PR API에 공통 draft field가 없으므로 `--draft`는 `WIP: ` title prefix로
-표현하고 server의 `WORK_IN_PROGRESS_PREFIXES`에 해당 prefix를 유지한다. remote source
-branch 삭제 여부는 Gitea repository 정책에 맡기며 API token으로 임의 삭제하지 않는다.
-현재 adapter는 configured remote를 push 대상과 PR base repository로 함께 사용한다. 따라서
-같은 repository의 branch PR만 지원하며 fork → upstream PR은 별도의 head owner/remote 계약을
-추가하기 전까지 명시적으로 지원하지 않는다.
+### finish
 
-`sync`의 `cherry-pick -x`/patch-id 비교는 squash merge를 완전하게 판별하지 못할 수 있다. squash
-merge 뒤 필요한 커밋이 여전히 pending으로 보이면 Gitea와 Git history를 수동 확인해야 하며, kit는
-review metadata로 이를 보정하지 않는다.
-
----
-
-# 4. CLI 공통 규칙
+`review finish`는 provider가 `merged`를 반환한 경우에만 mutation을 수행한다.
 
 ```text
-kit [global flags] <command> [arguments] [flags]
+provider merged 확인
+  ↓
+base-only fast-forward
+  ↓
+provider-confirmed source commits reconcile
+  ↓
+normal Git-only sync
+  ↓
+managed local/remote review branch exact-tip cleanup
 ```
 
-global flag는 실제 사용하는 milestone에 맞춰 추가한다.
+이 provider-aware reconcile은 squash merge를 안전하게 처리하기 위한 별도 boundary다. 일반 `sync`의 Git-only contract는 유지된다.
 
-| Flag | 도입 | 의미 |
-|---|---|---|
-| `--no-color` | v0.1 | ANSI color 비활성화 |
-| `--yes` | v0.1 | mutation 명령의 확인 생략 |
-| `--cwd <path>` | v0.2 | 해당 directory를 기준으로 실행 |
-| `--json` | v0.2 | 자동화 가능한 JSON 출력 |
-| `--verbose` | v0.2 | 실행한 하위 명령과 진단 정보 출력 |
+branch cleanup은 saved PublishedTip과 현재 local/remote tip이 정확히 일치할 때만 수행한다.
 
-초기 exit code 계약:
+자동화:
 
-| Code | 의미 |
-|---|---|
-| `0` | 성공, 변경할 항목 없음, 명시적 사용자 취소 |
-| `1` | validation 또는 실행 실패 |
-| `2` | 잘못된 argument나 flag |
-| `3` | 해결이 필요한 cherry-pick conflict가 남음 |
-| `130` | `SIGINT`로 중단 |
+```sh
+kit review finish <branch> --yes --json
+```
 
-원칙:
+## 9. Sync / rebuild invariant
 
-- read-only 명령과 mutation 명령을 분리한다.
-- command가 직접 `os.Exit`하지 않는다.
-- Git 실행은 공통 runner와 Git service를 사용한다.
-- 오류는 원인, 사용자가 할 수 있는 조치, 일관된 exit code를 제공한다.
-- 사람이 읽는 출력은 `kit · <command>`(결과), `kit ! <notice>`(알림), `$ kit ...`(다음
-  명령) 형식을 공통으로 사용하며 색상 없이도 의미가 구분돼야 한다.
-- `NO_COLOR`, `--no-color`, non-TTY에서는 ANSI escape를 출력하지 않는다.
-- v0.1부터 command는 결과 구조를 반환하고, v0.2의 JSON 출력은 같은 구조를 사용한다.
-- 공개하지 않은 기능을 위한 framework를 미리 만들지 않는다.
+`kit sync`의 핵심 원칙은 **완료 전까지 original work를 잃지 않는다**이다.
 
----
+일반 흐름:
 
-# 5. 최소 구조
+1. clean tree 확인
+2. configured remote fetch/prune
+3. base remote relation 검증
+4. original base/work/checkout hash 기록
+5. base fast-forward
+6. original work backup 생성
+7. temporary branch에서 latest base + pending first-parent commit rebuild
+8. 성공한 경우에만 source ref 이동
+9. original checkout 복원
+
+실패 시:
+
+- in-progress cherry-pick abort
+- original source/base ref 복원
+- original checkout 복원
+- hash 검증
+- 필요 시 partial resolved commits를 `kit/recovery/*`에 보존
+
+자동 backup ref는 source ownership을 포함한 namespace를 사용한다.
 
 ```text
-kit/
-├── README.md
-├── go.mod
-├── go.sum
-├── Makefile
-├── install.sh
-│
-├── cmd/
-│   └── kit/
-│       └── main.go
-│
-├── internal/
-│   ├── app/
-│   ├── buildinfo/
-│   ├── clierror/
-│   ├── git/
-│   ├── hosting/
-│   ├── review/
-│   ├── reviewstate/
-│   ├── selector/
-│   ├── ui/
-│   └── update/
-│
-├── site/
-│   ├── index.html
-│   ├── styles.css
-│   ├── app.js
-│   └── favicon.svg
-│
-├── deploy/
-│   ├── activate.sh
-│   ├── ssh-wrapper.sh
-│   ├── generate-release-metadata.sh
-│   ├── apps-prod/
-│   └── edge/
-│
-└── .gitea/
-    └── workflows/
-        ├── ci.yml
-        ├── docs.yml
-        └── release.yml
+kit/backup/v2/<source-sha256>/<kind>/<id>
 ```
 
-Go unit·integration test는 대상 package의 `*_test.go`에 함께 둔다. 임시 Git repository는
-test에서 생성하므로 별도 fixture directory를 유지하지 않는다.
+정상 backup은 recovery point이므로 자동 문제로 취급하지 않는다.
 
-초기에는 다음을 만들지 않는다.
+## 10. Recovery diagnostics
 
-- 별도 배포 backend
-- 복잡한 release metadata migration 계층
-- `uninstall.sh`를 포함한 여러 관리 script
-- plugin framework
-- 범용 setup engine
-- package manager abstraction
-- 필요하지 않은 OS abstraction
-
-OS별 차이가 실제 command에서 생기면 해당 기능 가까이에 작은 interface를 추가한다.
-
-## 5.1 의존성 정책
-
-`kit`은 가능한 기능을 Go binary에 compile하여 포함하고, 사용자에게 별도 utility 설치를
-요구하지 않는다.
-
-| 영역 | 처리 방식 | 사용자 외부 의존성 |
-|---|---|---|
-| Commit selector | Go TUI library를 binary에 포함 | 없음 |
-| HTTP download / update | Go standard library | 없음 |
-| SHA-256 검증 | Go standard library | 없음 |
-| SemVer 비교 | Go package 또는 내부 구현을 binary에 포함 | 없음 |
-| Git 조회 / mutation | system `git` executable 호출 | `git` |
-| 최초 bootstrap | POSIX shell installer | `/bin/sh`, `curl`, SHA-256 command |
-
-Git은 내장 재구현하거나 binary에 묶지 않는다. `compare`는 Git의 stable patch-id와 실제
-repository config를 사용하고, `cherry-pick`은 conflict state, hook, continue / skip /
-abort 동작을 Git과 동일하게 유지해야 하기 때문이다. command 실행 전에 `git` 존재 여부와
-지원 version을 검사하고 없으면 OS별 설치 방법을 안내한다. 최소 지원 version은 Git
-`2.34.0`으로 고정한다.
-
-Go dependency는 최종 실행 파일에 정적으로 포함하므로 사용자는 TUI library 등을 따로
-설치하지 않는다. 새 dependency는 기능 구현에 필요한 최소 package만 추가하고 version을
-`go.mod`와 `go.sum`에 고정한다.
-
----
-
-# 6. 설치
-
-설치에는 repository의 `install.sh` 하나만 사용한다. 이 script는 설치 bootstrap만
-담당하며 CLI 기능이나 환경 구성 로직을 포함하지 않는다.
-
-```bash
-curl -fsSL https://kit.2juho.com/install.sh | sh
+```sh
+kit doctor --recovery
 ```
 
-`install.sh`가 하는 일은 다음으로 제한한다.
+검사 항목:
+
+- pickstate 존재
+- `CHERRY_PICK_HEAD`
+- `kit/recovery/*`
+- `kit/tmp/*`
+- stale Kit-created marker
+- saved/active reviewstate count
+- retained backup count (informational)
+
+`--network`과 `--recovery`는 각각 network health와 local interrupted state라는 다른 boundary를 검사하므로 별도 실행한다.
+
+## 11. Network diagnostics
+
+```sh
+kit doctor --network
+```
+
+read-only 원칙:
+
+- `git ls-remote`로 remote stable/base 조회
+- remote source absence 확인
+- local remote-tracking ref를 변경하지 않음
+- Gitea authenticated repository API ping
+
+기본 `kit doctor`는 network를 사용하지 않는다.
+
+## 12. Credential / HTTP boundary
+
+canonical provider는 Gitea다.
+
+credential 우선순위:
+
+1. `KIT_GITEA_TOKEN` + exact `KIT_GITEA_HOST` pair
+2. stored credential
+
+둘 중 environment 변수 하나만 존재하면 실패한다.
+
+stored credential:
+
+- macOS: Keychain
+- Ubuntu: Secret Service
+- explicit fallback: permission-restricted local file
+
+review API origin은 repository origin과 exact match해야 하며 redirect도 같은 origin만 허용한다.
+
+HTTP는 다음 조건을 모두 만족하는 Gitea에만 명시 허용한다.
+
+- repository remote 자체가 HTTP
+- `git.allow-insecure-http=true`
+- literal private/loopback/link-local IP
+
+public IP/hostname HTTP는 허용하지 않는다.
+
+JSON/CI/non-TTY에서는 macOS Keychain interactive unlock prompt를 자동으로 열지 않는다.
+
+## 13. Worktree / branch cleanup
+
+`kit worktree`는 native Git worktree를 관리한다.
+
+- existing local branch attach
+- `--create --base`로 명시적 새 branch 생성
+- remove는 worktree만 제거하고 branch 보존
+- prune은 stale administrative data 정리
+
+`kit branch-clean`은 기본 dry-run이다.
+
+삭제 후보는 Kit-created local branch 중:
+
+- base의 ancestor이거나
+- branch의 모든 direct first-parent nonmerge commit이 base에 applied
+
+인 경우다.
+
+보호 대상:
+
+- stable/base/source
+- current branch
+- any worktree checkout branch
+- backup/recovery/tmp namespace
+- unapplied commit branch
+- review-side merge 때문에 안전하게 분류할 수 없는 branch
+
+remote branch는 `branch-clean`이 삭제하지 않는다. provider-confirmed remote review branch cleanup은 `review finish`에서만 수행한다.
+
+## 14. Self-update / rollback
+
+production update sequence:
+
+1. HTTPS release metadata fetch
+2. schema/version/commit/build/asset origin validation
+3. binary download with size limit
+4. SHA-256 verification
+5. downloaded binary `version --json` execution and build metadata comparison
+6. current installed binary를 `<kit>.previous`에 보존
+7. atomic replacement
+8. installed binary metadata 재검증
+
+`kit update --check`는 metadata만 읽고 filesystem을 변경하지 않는다.
+
+`kit update --rollback`은 network 없이 previous binary를 실행·검증한 뒤 current/previous를 transactional swap한다. symlink/special file은 rollback source로 거부한다.
+
+## 15. Deploy trust boundary
+
+GitHub가 upstream source이고 main/develop push는 Gitea로 mirror된다.
+
+release/deploy에서 중요한 boundary:
+
+- GitHub/Gitea action dependency SHA pinning
+- tag가 `origin/main` ancestry 안에 있어야 release 가능
+- build checksum + release metadata 생성
+- SSH host key strict verification
+- manual/Gitea deploy key separation
+- dedicated deploy account
+- forced-command wrapper
+- fixed root-owned activator path
+- archive size/time limits
+- upload lock
+
+`deploy/ssh-wrapper.sh`는 malformed `SSH_ORIGINAL_COMMAND`를 filesystem/activator 접근 전에 검증한다.
+
+Linux CI는 production wrapper를 black-box 실행해 identity, token count, operation allowlist, SHA/SemVer validation, shell/traversal 입력 거부를 검증한다.
+
+privileged activator의 실제 `/srv` atomic activation/rollback은 서버 trust boundary 안에 있으며 현재 GitHub unprivileged CI에서 end-to-end로 실행하지 않는다.
+
+## 16. CI
+
+GitHub Verify:
+
+### Ubuntu
 
 ```text
-1. uname으로 OS와 architecture 확인
-2. Linux는 /etc/os-release로 Ubuntu 24.04인지 확인하고 두 지원 target 중 하나로 변환
-3. version.txt에서 현재 stable SemVer tag 확인
-4. 해당 version directory에서 target binary와 checksums.txt 다운로드
-5. binary의 SHA-256 checksum 확인
-6. 실행 권한 설정
-7. ~/.local/bin/kit에 설치
-8. kit version 실행으로 확인
+gofmt
+go vet ./...
+go test ./...
+shell syntax
+forced-command rejection integration tests
 ```
 
-download URL은 항상 최신 production deployment를 가리킨다.
+### macOS Apple Silicon
 
 ```text
-https://kit.2juho.com/version.txt
-https://kit.2juho.com/downloads/vX.Y.Z/kit_darwin_arm64
-https://kit.2juho.com/downloads/vX.Y.Z/kit_linux_amd64
-https://kit.2juho.com/downloads/vX.Y.Z/checksums.txt
+GOOS=darwin
+GOARCH=arm64
+uname -m=arm64
+gofmt
+go vet ./...
+go test ./...
+native build
+kit version --json execution
 ```
 
-installer는 JSON parser나 Gitea API를 사용하지 않는다. `version.txt`는 `vX.Y.Z` 한
-줄만 허용하며 installer가 형식을 검증한다. version directory는 release 후 변경하지
-않으므로 binary와 checksum이 다른 build에서 섞이지 않는다.
+Gitea mirror 성공 여부도 GitHub workflow에서 확인한다.
 
-설치 원칙:
+## 17. Compatibility
 
-- 기본 실행에서 `sudo`를 사용하지 않는다.
-- checksum이 다르면 설치하지 않는다.
-- 지원하지 않는 OS 또는 architecture면 다운로드 전에 종료한다.
-- 임시 binary는 최종 설치 directory에 만들고 검증 후 atomic rename한다.
-- 기존 binary가 있으면 새 binary 검증이 끝날 때까지 유지한다.
-- `${HOME}/.local/bin`이 `PATH`에 없을 때만 shell 시작 파일에 한 줄을 idempotent하게
-  추가하고, 무엇을 변경했는지 출력한다.
-- zsh는 `~/.zshrc`, bash/sh는 `~/.profile`을 대상으로 한다.
-- shell 시작 파일을 변경하기 전에 같은 directory에 backup을 만든다.
-- 현재 shell에서는 설치된 binary의 절대 경로로 검증하고, 사용자는 새 terminal부터
-  바로 `kit`을 사용할 수 있어야 한다.
-- `curl` 또는 SHA-256 도구가 없으면 검증을 생략하지 않고 필요한 명령을 안내한다.
+다음은 compatibility namespace로 유지한다.
 
-child process인 installer는 현재 parent shell의 `PATH`를 변경할 수 없다. 따라서 설치
-직후 같은 shell에서는 `${HOME}/.local/bin/kit`으로 실행하고, shell 시작 파일 변경은
-새 terminal부터 적용된다는 점을 완료 메시지에 명확히 표시한다.
+- `kit git ...`
+- `kit self ...`
+- legacy reviewstate provider values (`gitlab`, `forgejo`) 읽기
+- legacy `work` backup namespace는 ownership을 증명할 수 있는 기본 `work`에 한해 제한적으로 처리
 
-복잡한 installer option, channel, profile, 별도 uninstall 과정은 실제 필요가 생길 때까지
-추가하지 않는다.
+새 기능과 문서는 top-level command와 Gitea canonical workflow를 기준으로 한다.
 
----
+## 18. 현재 의도적으로 남겨 둔 범위
 
-# 7. Docs 웹과 자동 배포
+다음은 core daily workflow와 분리되어 있어 우선순위가 낮다.
 
-`https://kit.2juho.com`은 항상 접근 가능한 단일 페이지 docs이자 최신 binary 배포
-endpoint다. 홈 네트워크의 web server가 정적 파일을 제공하고 Cloudflare가 DNS와 외부
-hostname을 관리한다. `kit.2juho.com`은 Cloudflare DNS-only record로 public origin에 직접
-연결하며 Cloudflare HTTP proxy와 VPN을 거치지 않는다.
+- `port` / `process` 같은 범용 개발 utility
+- fork repository에서 upstream repository로 직접 PR을 만드는 별도 push/target repository 모델
+- privileged deploy activator의 CI end-to-end fixture
+- GitHub repository branch protection/ruleset의 자동 설정
 
-기존 홈 인프라의 public IP 또는 DDNS, router 443 forwarding, firewall, HTTPS 인증서와
-edge Nginx reverse proxy를 재사용하고 설정은 직접 관리한다. edge가 TLS를 종료하고
-apps-prod의 사설 IP `18080`에 있는 Docker 정적 origin으로 전달한다. public endpoint는
-정적 docs, installer, release metadata와 download file만 제공하며 apps-prod origin port,
-private Gitea, Gitea Runner, SSH deploy endpoint는 외부에 노출하지 않는다.
-
-## 7.1 단일 페이지 구성
-
-한 페이지에서 다음 정보를 제공한다.
-
-```text
-kit 소개
-한 줄 설치 명령
-지원 OS / architecture
-kit compare 사용법
-kit pick 사용법
-OS별 직접 다운로드 button
-현재 version / build commit / 배포 시각
-최근 변경 내용
-kit update 사용법
-private Gitea source는 public page에 노출하지 않음
-```
-
-초기 웹은 `site/index.html`, `styles.css`, `app.js`로 구현한다. React나 별도 static site
-generator는 사용하지 않는다. 기능 설명과 변경 내용은 main branch의 `index.html`에
-작성하며, 핵심 설치법과 command 설명은 JavaScript 없이도 읽을 수 있어야 한다.
-`app.js`는 `release.json`을 읽어 현재 build 정보와 OS별 download link만 갱신한다.
-기능을 변경할 때 page의 command 설명과 최근 변경 항목도 함께 수정한다. deploy workflow가
-source file을 다시 commit하지는 않는다.
-
-workflow는 다음 최소 metadata를 생성한다.
-
-```json
-{
-  "schema_version": 1,
-  "version": "v0.1.0",
-  "build": "<short-commit-sha>",
-  "commit": "<full-commit-sha>",
-  "published_at": "<UTC ISO-8601>",
-  "downloads": {
-    "darwin-arm64": {
-      "url": "/downloads/v0.1.0/kit_darwin_arm64",
-      "sha256": "<sha256>"
-    }
-  }
-}
-```
-
-이 파일은 `https://kit.2juho.com/release.json`으로 배포한다. website와 Go updater는
-동일한 metadata를 사용하므로 별도의 표시 version을 관리하지 않는다. shell installer는
-구현을 단순하게 유지하기 위해 고정 download path와 `checksums.txt`를 사용한다.
-`downloads`에는 두 지원 target을 모두 포함한다.
-
-## 7.2 저장 구조
-
-docs와 CLI release를 분리하여 main 배포가 기존 다운로드를 지우지 않게 한다.
-
-```text
-/srv/data/apps/kit/data/
-├── sites/
-│   └── <main-commit>/
-├── releases/
-│   └── vX.Y.Z/
-│       ├── version.txt
-│       ├── release.json
-│       ├── checksums.txt
-│       └── kit_<os>_<arch>
-├── current-site -> sites/<main-commit>
-└── current-release -> releases/vX.Y.Z
-```
-
-web server route:
-
-```text
-/                  → current-site
-/install.sh        → current-site/install.sh
-/version.txt       → current-release/version.txt
-/release.json      → current-release/release.json
-/downloads/vX.Y.Z/ → releases/vX.Y.Z/
-```
-
-apps-prod Docker Nginx는 host data directory를 `/srv/kit`에 read-only mount한다. edge는
-host filesystem을 직접 읽지 않고 이 origin으로 reverse proxy한다. origin Nginx는
-directory listing을 비활성화하고 download binary에
-`application/octet-stream`과 적절한 `Content-Disposition` header를 제공한다. 정적
-download에는 실행 권한이 필요하지 않으며 installer가 검증 후 local 실행 권한을 설정한다.
-
-새 docs 또는 release는 임시 directory에서 검증한 후 symlink를 atomic하게 교체한다.
-문제 발생 시 symlink를 직전 directory로 되돌려 rollback한다.
-
-Proxmox 내부의 CI Runner 서버와 배포 서버는 분리한다. Gitea Runner는 build 결과를
-제한된 SSH deploy 계정으로 배포 서버의 staging directory에 전송한다. deploy 계정은
-`/srv/data/apps/kit/data` 아래의 staging 배치, 검증, symlink 교체에 필요한
-권한만 가진다. SSH key에는
-Runner source IP, `restrict`와 server-side forced command를 적용한다. workflow가 저장소의
-임의 script를 원격 shell에서 실행하지 않으며, root 소유 wrapper가 허용된 site/release
-upload 형식만 받아 고정된 activator를 호출한다.
-
-## 7.3 Main branch docs deployment
-
-`main` push는 docs만 갱신하며 CLI binary와 stable version은 변경하지 않는다.
-
-```text
-main push
-  → docs source 검증
-  → site directory 조립
-  → preview / staging smoke test
-  → sites/<main-commit> 배치
-  → current-site symlink 교체
-```
-
-docs workflow가 실패하면 기존 `current-site`를 유지한다. 느리게 끝난 이전 workflow가
-최신 문서를 덮어쓰지 않도록 배포 직전에 대상 commit이 현재 main HEAD인지 확인한다.
-
-## 7.4 Version tag CLI release
-
-`vX.Y.Z` tag push에서만 binary와 stable download metadata를 갱신한다.
-
-```text
-vX.Y.Z tag push
-  → unit / integration test
-  → 두 target build
-  → kit version smoke test
-  → target binary와 checksums.txt 생성
-  → version.txt와 release.json 생성
-  → SSH로 배포 서버 staging directory에 전송
-  → releases/vX.Y.Z 배치
-  → download URL smoke test
-  → current-release symlink 교체
-  → 정상 release 최신 5개를 제외한 이전 directory 정리
-```
-
-필수 release 조건:
-
-- tag가 `vX.Y.Z` SemVer 형식이어야 한다.
-- 같은 version directory를 덮어쓰지 않는다.
-- test나 artifact 검증이 실패하면 `current-release`를 변경하지 않는다.
-- 두 binary, checksum, version identifier, release metadata가 모두 있어야 한다.
-- `kit version`에 version, commit, build target, build time을 주입한다.
-- 새 binary 정보가 `release.json`과 일치해야 한다.
-- `version.txt`, `release.json`은 web server에서 `no-cache` 또는 동등한 revalidation
-  header를 제공한다.
-- cleanup은 새 release의 smoke test와 `current-release` 교체가 성공한 뒤 실행한다.
-- 현재 release와 rollback 대상인 직전 release는 cleanup 도중 삭제하지 않는다.
-
-Gitea Actions workflow는 `.gitea/workflows/`에 둔다. untrusted PR을 검사하는 `kit-ci`
-Runner와 배포 secret을 사용하는 `kit-deploy` Runner는 OS account, work directory, cache,
-등록 token과 network 권한을 분리한다. deploy Runner는 보호된 main/tag workflow만 받고
-배포 서버의 forced-command SSH endpoint 외 다른 Proxmox service에 접근하지 않는다.
-label 자체는 권한 경계가 아니므로 홈 kit repository는 배포 책임자만 branch write가
-가능하게 제한한다. 다른 개발자에게 same-repository write를 허용할 때는 배포 workflow와
-secret을 PR을 받지 않는 별도 deployment repository/Gitea scope로 먼저 분리한다.
-
----
-
-# 8. CLI 업데이트
-
-```bash
-kit version
-kit update
-```
-
-`kit update`는 Go 코드로 구현한다. 별도 update shell script를 만들지 않는다.
-
-```text
-https://kit.2juho.com/release.json 조회
-  → 현재 SemVer와 stable version 비교
-  → 현재 OS / architecture download 선택
-  → 임시 파일에 다운로드
-  → release.json의 SHA-256 검증
-  → kit version smoke test
-  → 기존 binary 교체
-```
-
-규칙:
-
-- 이미 최신이면 성공으로 종료한다.
-- checksum 검증 전에는 binary를 실행하지 않는다.
-- download 또는 검증 실패 시 기존 binary를 그대로 둔다.
-- 실행 중인 binary의 실제 경로를 확인하고, installer로 설치한
-  `${HOME}/.local/bin/kit`과 일치할 때만 직접 갱신한다.
-- 다른 경로나 symlink를 통해 실행됐다면 임의의 binary를 교체하지 않고 재설치 방법을
-  안내한다.
-- 임시 binary는 설치 directory에 만들고 검증 후 atomic rename한다.
-- write 권한이 없으면 `sudo`를 실행하지 않고 재설치 방법을 안내한다.
-- background update와 자동 downgrade는 하지 않는다.
-- release version이 현재 version보다 클 때만 update한다.
-- 교체 전 새 binary의 version, commit, target, build time이 `release.json`과 일치하는지
-  확인한다.
-
----
-
-# 9. 테스트
-
-## Unit test
-
-- argument와 flag parsing
-- `compare`의 반영 / 미반영 분류
-- `cherry-pick` 후보 filtering과 source 위상 순서 정렬
-- fuzzy 검색, cursor 이동, 다중 선택, 확정과 취소
-- non-TTY에서 selector 시작 거부
-- patch-id 또는 `-x` 기록에 따른 중복 제외
-- 오류와 exit code mapping
-- Human / JSON 결과 일치
-- OS / architecture asset 이름 선택
-- SemVer와 release metadata parsing
-- rollback된 이전 deployment를 자동 downgrade로 설치하지 않음
-
-## Integration test
-
-임시 Git repository를 만들어 검증한다.
-
-- source에만 존재하는 commit 비교
-- patch가 이미 base에 적용된 경우
-- 새 branch 생성과 `cherry-pick -x`
-- dirty working tree 거부
-- 기존 branch 거부
-- conflict의 continue / skip / abort
-- process 종료 후 `kit pick --continue` 재개
-- stale work에서 pick 차단
-- sync 성공 시 applied commit 제거와 pending commit 보존
-- sync conflict의 continue / skip / abort와 실제 pending/skipped 수
-- sync abort 또는 입력 종료 시 기존 work, checkout, 갱신된 base 복원과 실패 backup 정리
-- work backup cleanup의 dry-run, 확인, 기본/`--all` 범위와 부분 삭제 실패
-- local/remote target branch 충돌 차단
-- Gitea remote URL과 review 주소 생성
-
-## CI / Deploy smoke test
-
-- Apple Silicon macOS runner에서 `darwin/arm64` build와 실행
-- Ubuntu 24.04 LTS에서 `linux/amd64` build와 실행
-- deploy binary에 실행 권한을 설정한 후 `kit version` 실행
-- checksum 불일치 artifact 설치 거부
-- 이전 설치본에서 `kit update` 성공
-- single-page content, `release.json`, 두 download link 응답 확인
-- JavaScript를 끈 상태에서도 설치 명령과 command 설명이 보이는지 확인
-- desktop과 mobile viewport에서 설치 명령과 download button 사용 확인
-
----
-
-# 10. 구현 순서
-
-## v0.1 — shell 명령 통합과 설치
-
-```text
-CLI parser와 공통 runner
-Git service
-kit compare
-kit pick
-kit version
-Human output
---no-color / --yes
-필수 오류 처리
-두 target build
-single-page docs
-main docs workflow
-version tag release workflow
-install.sh
-```
-
-완료 조건:
-
-- 기존 `ghash`의 반영 상태 확인을 `kit compare`로 대체할 수 있다.
-- 기존 `gpick`의 branch 생성과 cherry-pick 흐름을 `kit pick`으로 대체할 수 있다.
-- 깨끗한 macOS Apple Silicon과 Ubuntu에서 한 줄 명령으로 설치된다.
-- 설치 직후 `${HOME}/.local/bin/kit version`이 실행되고, 새 terminal에서는 `kit`으로
-  두 command가 실행된다.
-- `main` 배포 후 `kit.2juho.com`의 기능 설명과 변경 내용이 반영된다.
-- `vX.Y.Z` tag 배포 후 version 정보와 두 download가 함께 반영된다.
-
-## v0.2 — 업데이트와 자동화 출력
-
-```text
-kit update
---json
---cwd
---verbose
-```
-
-완료 조건:
-
-- v0.1 설치본을 binary 재설치 없이 최신 version으로 올릴 수 있다.
-- update 실패 시 기존 CLI가 계속 실행된다.
-
-## v0.3 — 협업 Git workflow
-
-```text
-kit compare → kit pick → Gitea merge → kit sync
-kit pick / --all / --local
-legacy metadata: status / review
-legacy kit git namespace compatibility
-kit backup list / create / restore / cleanup
-kit auth login / status / list / logout
-repository-local kit.git.* config
-Gitea provider와 legacy provider 호환
-중단 가능한 pick state
-```
-
-완료 조건:
-
-- 다른 개발자의 merge 후 최신 develop 위에 direct first-parent pending work commit만 재구성하고, 원본 work backup을 남긴다.
-- sync 실패 시 기존 work, checkout과 develop을 검증된 상태로 되돌리고 실패 backup을 정리한다.
-- stale work에서는 새 review branch 생성을 차단한다.
-- 회사와 개인 Gitea repository에서 같은 local 명령을 사용한다.
-- review 생성, merge 확인, work sync와 안전한 local branch 정리를 한 흐름으로 실행한다.
-- release tag는 origin/main에 포함된 commit만 허용한다.
-
-## v0.4 — 필요한 shell 명령 추가
-
-실제 반복 사용 중인 shell script만 하나씩 Go subcommand로 옮긴다.
-
-후보:
-
-```bash
-kit worktree
-kit branch-clean
-kit port
-kit process
-```
-
-명령을 추가하기 전에 다음을 확인한다.
-
-- 반복해서 사용하는 명령인가?
-- OS별 차이를 CLI가 숨겨 주는 가치가 있는가?
-- 기존 command의 option으로 해결하는 것보다 독립 command가 명확한가?
-
-dotfiles는 현재 version roadmap에서 제외한다. 명령 기능이 충분히 안정된 뒤 사용자가
-다시 요청할 때 별도 요구사항으로 설계하며, 지금은 관련 command, config, dependency를
-미리 만들지 않는다.
-
----
-
-# 11. 확정 사항
-
-확정된 운영 조건:
-
-- DNS: Cloudflare
-- origin: 개인 홈 네트워크
-- network: Cloudflare HTTP proxy 사용 안 함
-- access: Cloudflare DNS-only를 통한 인터넷 직접 공개
-- HTTPS: 기존 reverse proxy와 인증서 관리 체계 재사용
-- source: 협업 project, 개인 project와 kit source는 각 환경의 private Gitea repository
-- CI/CD: 업무 project와 kit은 각 Gitea instance의 Actions와 분리된 Gitea Runner 정책 사용
-- Proxmox: 개발, 배포, metrics, CI Runner 서버 분리
-- deploy: CI Runner에서 제한된 SSH 계정으로 배포 서버에 전송
-- `main` push: docs만 배포
-- `vX.Y.Z` tag push: CLI binary와 stable release metadata 배포
-- release retention: 최신 5개
-- Ubuntu: 24.04 LTS `linux/amd64`만 지원
-- Git workflow 기본값: `base=develop`, `source=work`
-- commit selector: 외부 `fzf` 없는 full-screen fuzzy multi-select 내장 UI
-- installer: shell 설정 backup 후 `~/.local/bin` PATH 자동 추가
-- update command: `kit update`
-- web server: edge Nginx와 apps-prod Docker Nginx, config 직접 관리
-- release version: 수동 `git tag vX.Y.Z` push, tag를 단일 version source로 사용
-
-v0.1 구현에 필요한 결정은 모두 완료됐다. 미확정 항목 없이 명령 기능 구현을 시작할 수
-있다.
-
----
-
-# 12. 현재 하지 않을 것
-
-- Intel Mac 지원
-- Windows 지원
-- 여러 설치 / 업데이트 script
-- 별도 배포 backend
-- 범용 package manager 또는 machine profile manager
-- VPN, server, secret manager
-- plugin system과 workflow engine
-- 사용하지 않는 기능을 위한 대규모 abstraction
-- installer의 PATH bootstrap을 제외한 dotfiles와 shell 설정 동기화 기능
-
----
-
-# 13. 한 문장 정의
-
-> `kit`은 macOS Apple Silicon과 Ubuntu에서 반복 사용하던 shell 명령을 명확한 Go
-> subcommand로 통합하고, `kit.2juho.com`에서 한 줄로 설치하고 스스로 업데이트할 수 있는
-> 개인용 CLI다.
+이 영역을 추가하더라도 Git-only sync, provider-confirmed review mutation, exact-tip cleanup, original-work rollback invariant를 깨지 않는 것이 우선이다.
