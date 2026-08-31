@@ -149,7 +149,7 @@ func (a *Application) Run(ctx context.Context, args []string) error {
 	case "compare":
 		return a.compare(ctx, global, rest)
 	case "pick":
-		return a.pick(ctx, global, rest)
+		return a.pickEnhanced(ctx, global, rest)
 	case "version":
 		return a.version(global, rest)
 	case "update":

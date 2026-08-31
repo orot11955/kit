@@ -54,6 +54,8 @@ func (a *Application) gitReview(ctx context.Context, global globalOptions, args 
 			return err
 		}
 		return a.reviewSubmit(ctx, g, opts, nil)
+	case "add":
+		return a.reviewAdd(ctx, global, args[1:])
 	case "status":
 		b, g, err := parseReviewBranchCommand(global, args[1:], "status")
 		if err != nil {
@@ -684,5 +686,5 @@ func isProtectedReviewBranch(b string, c gitservice.WorkflowConfig) bool {
 }
 
 func printReviewHelp(w io.Writer) {
-	fmt.Fprint(w, "Usage: kit review <command>\n\nCommands:\n  submit [options]    Push the current branch and create or reuse a Gitea PR\n  status [branch]     Refresh and show the saved PR state when supported\n  wait [branch]       Deprecated no-op; use status instead\n  finish [branch]     Verify merge, reconcile work, and clean managed review branches\n  list                List locally saved review states\n")
+	fmt.Fprint(w, "Usage: kit review <command>\n\nCommands:\n  submit [options]    Push the current branch and create or reuse a Gitea PR\n  add [branch]        Add pending work commits to an open managed PR\n  status [branch]     Refresh and show the saved PR state when supported\n  wait [branch]       Deprecated no-op; use status instead\n  finish [branch]     Verify merge, reconcile work, and clean managed review branches\n  list                List locally saved review states\n")
 }
