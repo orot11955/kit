@@ -38,18 +38,25 @@ func reconcileMergedReviewQueue(ctx context.Context, service gitservice.Service,
 	if err != nil {
 		return result, fmt.Errorf("list source commits for review reconcile: %w", err)
 	}
+	candidates, err = service.Applied(ctx, config.Base, candidates)
+	if err != nil {
+		return result, fmt.Errorf("classify source commits for review reconcile: %w", err)
+	}
 	keep := make([]gitservice.Commit, 0, len(candidates))
 	for _, commit := range candidates {
-		drop := false
+		dropTrusted := false
 		if _, ok := trusted[strings.ToLower(commit.Hash)]; ok {
-			drop = true
+			dropTrusted = true
 		} else if original, ok, sourceErr := service.CherryPickedFrom(ctx, commit.Hash); sourceErr != nil {
 			return result, fmt.Errorf("inspect source commit %s: %w", commit.ShortHash, sourceErr)
 		} else if ok {
-			_, drop = trusted[strings.ToLower(original)]
+			_, dropTrusted = trusted[strings.ToLower(original)]
 		}
-		if drop {
+		if dropTrusted {
 			result.Dropped++
+			continue
+		}
+		if commit.Applied {
 			continue
 		}
 		keep = append(keep, commit)
