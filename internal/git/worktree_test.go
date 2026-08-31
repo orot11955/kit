@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -13,8 +14,8 @@ func TestWorktreeLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if root != filepath.Clean(dir) {
-		t.Fatalf("top level=%q want %q", root, filepath.Clean(dir))
+	if !sameExistingPath(t, root, dir) {
+		t.Fatalf("top level=%q want same filesystem path as %q", root, filepath.Clean(dir))
 	}
 
 	createdPath := filepath.Join(t.TempDir(), "created")
@@ -27,7 +28,7 @@ func TestWorktreeLifecycle(t *testing.T) {
 	}
 	found := false
 	for _, item := range worktrees {
-		if filepath.Clean(item.Path) == filepath.Clean(createdPath) {
+		if sameExistingPath(t, item.Path, createdPath) {
 			found = true
 			if item.Branch != "feat/worktree" || item.Detached || item.Head == "" {
 				t.Fatalf("unexpected worktree: %#v", item)
@@ -52,4 +53,17 @@ func TestWorktreeLifecycle(t *testing.T) {
 	if err := service.RemoveWorktree(context.Background(), existingPath, false); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func sameExistingPath(t *testing.T, left, right string) bool {
+	t.Helper()
+	leftInfo, err := os.Stat(left)
+	if err != nil {
+		t.Fatalf("stat %s: %v", left, err)
+	}
+	rightInfo, err := os.Stat(right)
+	if err != nil {
+		t.Fatalf("stat %s: %v", right, err)
+	}
+	return os.SameFile(leftInfo, rightInfo)
 }
