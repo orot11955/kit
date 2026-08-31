@@ -38,10 +38,13 @@ type Release struct {
 }
 
 type Result struct {
-	Current string `json:"current"`
-	Latest  string `json:"latest"`
-	Updated bool   `json:"updated"`
-	Path    string `json:"path,omitempty"`
+	Current         string `json:"current"`
+	Latest          string `json:"latest,omitempty"`
+	Previous        string `json:"previous,omitempty"`
+	Updated         bool   `json:"updated"`
+	UpdateAvailable bool   `json:"update_available"`
+	RolledBack      bool   `json:"rolled_back,omitempty"`
+	Path            string `json:"path,omitempty"`
 }
 
 type Config struct {
@@ -50,11 +53,17 @@ type Config struct {
 	Current      buildinfo.Info
 	Executable   string
 	ExpectedPath string
+	PreviousPath string
+	CheckOnly    bool
+	Rollback     bool
 	AllowHTTP    bool // Test-only escape hatch; production callers leave this false.
 	RunVersion   func(context.Context, string) (buildinfo.Info, error)
 }
 
 func Run(ctx context.Context, cfg Config) (Result, error) {
+	if cfg.CheckOnly && cfg.Rollback {
+		return Result{}, errors.New("update check and rollback cannot be requested together")
+	}
 	if cfg.ReleaseURL == "" {
 		cfg.ReleaseURL = defaultReleaseURL
 	}
@@ -98,6 +107,9 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	if cfg.RunVersion == nil {
 		cfg.RunVersion = runVersion
 	}
+	if cfg.Rollback {
+		return rollback(ctx, cfg)
+	}
 
 	releaseURL, err := url.Parse(cfg.ReleaseURL)
 	if err != nil || releaseURL.Host == "" {
@@ -118,8 +130,12 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	if err != nil {
 		return Result{}, fmt.Errorf("current version %q cannot self-update: %w", cfg.Current.Version, err)
 	}
-	result := Result{Current: cfg.Current.Version, Latest: release.Version}
-	if cmp >= 0 {
+	result := Result{
+		Current:         cfg.Current.Version,
+		Latest:          release.Version,
+		UpdateAvailable: cmp < 0,
+	}
+	if cfg.CheckOnly || cmp >= 0 {
 		return result, nil
 	}
 
@@ -145,31 +161,13 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 		return Result{}, errors.New("release download URL must use the release metadata host")
 	}
 
-	executable, err := filepath.EvalSymlinks(cfg.Executable)
-	if err != nil {
-		return Result{}, fmt.Errorf("resolve current executable: %w", err)
-	}
-	executable, err = filepath.Abs(executable)
+	executable, expected, err := installedExecutable(cfg)
 	if err != nil {
 		return Result{}, err
 	}
-	expected, err := filepath.Abs(cfg.ExpectedPath)
+	previousPath, err := previousBinaryPath(cfg, expected)
 	if err != nil {
 		return Result{}, err
-	}
-	expected, err = filepath.EvalSymlinks(expected)
-	if err != nil {
-		return Result{}, fmt.Errorf("resolve expected install path: %w", err)
-	}
-	if executable != expected {
-		return Result{}, fmt.Errorf("self-update is only allowed for %s (currently running %s); reinstall with curl -fsSL https://kit.2juho.com/install.sh | sh", expected, executable)
-	}
-	installInfo, err := os.Lstat(cfg.ExpectedPath)
-	if err != nil {
-		return Result{}, fmt.Errorf("inspect expected install path: %w", err)
-	}
-	if installInfo.Mode()&os.ModeSymlink != 0 {
-		return Result{}, fmt.Errorf("self-update refuses symlink installation %s; reinstall with curl -fsSL https://kit.2juho.com/install.sh | sh", cfg.ExpectedPath)
 	}
 
 	temp, err := os.CreateTemp(filepath.Dir(executable), ".kit-update-*")
@@ -201,11 +199,15 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	if newInfo.Version != release.Version || newInfo.Commit != release.Commit || newInfo.BuildDate != release.PublishedAt || newInfo.Target != expectedTarget {
 		return Result{}, fmt.Errorf("downloaded binary metadata does not match release.json")
 	}
+	if err := preserveCurrentBinary(executable, previousPath); err != nil {
+		return Result{}, fmt.Errorf("preserve current binary for rollback: %w", err)
+	}
 	if err := os.Rename(tempPath, executable); err != nil {
 		return Result{}, fmt.Errorf("replace %s: %w", executable, err)
 	}
 	result.Updated = true
 	result.Path = executable
+	result.Previous = cfg.Current.Version
 	return result, nil
 }
 
