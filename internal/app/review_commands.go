@@ -234,12 +234,11 @@ func (a *Application) reviewSubmit(ctx context.Context, g globalOptions, o revie
 	if created.ID == "" || created.URL == "" || created.Number <= 0 {
 		return clierror.New(clierror.Failure, "provider returned incomplete PR metadata; local and remote branch %s were kept", branch)
 	}
-	state, e := savePublishedReview(ctx, s, c, branch, created)
-	if e != nil {
+	if _, e = savePublishedReview(ctx, s, c, branch, created); e != nil {
 		return clierror.Wrap(clierror.Failure, e, "PR #%d exists but local review state could not be saved", created.Number)
 	}
 	if g.json {
-		return writeJSON(a.IO.Out, state)
+		return writeJSON(a.IO.Out, created)
 	}
 	r := a.renderer(g)
 	if !o.embedded {
