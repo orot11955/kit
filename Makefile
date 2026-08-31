@@ -26,8 +26,10 @@ check:
 		deploy/generate-release-metadata.sh \
 		deploy/rollback.sh \
 		deploy/ssh-wrapper.sh \
+		deploy/tests/ssh-wrapper.sh \
 		deploy/apps-prod/deploy.sh \
 		deploy/deploy-manual.sh
+	bash deploy/tests/ssh-wrapper.sh
 
 release:
 	@if [ "$(VERSION)" = "dev" ]; then \

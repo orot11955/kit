@@ -36,8 +36,9 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-[[ -x $ACTIVATE_COMMAND && ! -L $ACTIVATE_COMMAND ]] || fail "server-side activator is unavailable"
-
+# Validate the forced command before touching server paths or the activator. This
+# keeps malformed requests side-effect free and makes the allowlist boundary
+# independently testable on an unprivileged CI runner.
 read -r operation identifier extra <<<"${SSH_ORIGINAL_COMMAND:-}"
 [[ -n $operation && -n $identifier && -z ${extra:-} ]] || fail "invalid command"
 
@@ -55,6 +56,8 @@ case "$operation" in
     fail "command is not allowed"
     ;;
 esac
+
+[[ -x $ACTIVATE_COMMAND && ! -L $ACTIVATE_COMMAND ]] || fail "server-side activator is unavailable"
 
 source_address=${SSH_CONNECTION%% *}
 [[ $source_address =~ ^[0-9A-Fa-f:.]+$ ]] || source_address=unknown
@@ -75,7 +78,7 @@ fi
 archive_size=$(wc -c <"$archive")
 (( archive_size > 0 && archive_size <= MAX_ARCHIVE_BYTES )) || fail "archive size is invalid"
 
-"$ACTIVATE_COMMAND" "$mode" "$identifier" "$archive"
+"$ACTIVATE_COMMAND" "$mode" "$identity" "$archive"
 archive=""
 logger -t kit-deploy \
   "identity=$identity source=$source_address operation=$operation identifier=$identifier completed" || true

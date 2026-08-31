@@ -35,7 +35,7 @@ func TestWorktreeCommandCreateListAndRemoveKeepsBranch(t *testing.T) {
 	}
 	found := false
 	for _, item := range listed {
-		if filepath.Clean(item.Path) == filepath.Clean(path) && item.Branch == "feat/linked" {
+		if item.Branch == "feat/linked" && sameAppFilesystemPath(t, item.Path, path) {
 			found = true
 		}
 	}
@@ -136,6 +136,19 @@ func TestBranchCleanClassifiesAndDeletesOnlySafeKitBranches(t *testing.T) {
 	if marked, err := service.IsKitCreatedBranch(ctx, "feat/missing"); err != nil || marked {
 		t.Fatalf("stale marker remained: marked=%v err=%v", marked, err)
 	}
+}
+
+func sameAppFilesystemPath(t *testing.T, left, right string) bool {
+	t.Helper()
+	leftInfo, err := os.Stat(left)
+	if err != nil {
+		t.Fatalf("stat %s: %v", left, err)
+	}
+	rightInfo, err := os.Stat(right)
+	if err != nil {
+		t.Fatalf("stat %s: %v", right, err)
+	}
+	return os.SameFile(leftInfo, rightInfo)
 }
 
 func containsBranchCleanEntry(entries []branchCleanEntry, branch string) bool {
