@@ -41,11 +41,7 @@ func run(ctx context.Context, dir string, input []byte, args ...string) ([]byte,
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		message := redactGitError(strings.TrimSpace(stderr.String()))
-		if message == "" {
-			message = err.Error()
-		}
-		return stdout.Bytes(), fmt.Errorf("git %s: %s", strings.Join(args, " "), message)
+		return stdout.Bytes(), commandFailure(args, strings.TrimSpace(stderr.String()), err)
 	}
 	return stdout.Bytes(), nil
 }
@@ -193,12 +189,10 @@ func (s Service) LocalBranchExists(ctx context.Context, branch string) (bool, er
 	if err == nil {
 		return true, nil
 	}
-	// show-ref exits 1 when it simply did not find the branch.
-	out, fallbackErr := s.run(ctx, "for-each-ref", "--format=%(refname)", "refs/heads/"+branch)
-	if fallbackErr != nil {
-		return false, fallbackErr
+	if IsExitCode(err, 1) {
+		return false, nil
 	}
-	return strings.TrimSpace(string(out)) != "", nil
+	return false, err
 }
 
 func (s Service) IsClean(ctx context.Context) (bool, error) {
@@ -213,7 +207,10 @@ func (s Service) Head(ctx context.Context) (string, string, error) {
 	}
 	branchOut, err := s.run(ctx, "symbolic-ref", "--quiet", "--short", "HEAD")
 	if err != nil {
-		return strings.TrimSpace(string(hashOut)), "", nil
+		if IsExitCode(err, 1) {
+			return strings.TrimSpace(string(hashOut)), "", nil
+		}
+		return "", "", err
 	}
 	return strings.TrimSpace(string(hashOut)), strings.TrimSpace(string(branchOut)), nil
 }
@@ -262,39 +259,54 @@ func (s Service) Commit(ctx context.Context, revision string) (Commit, error) {
 var pickedPattern = regexp.MustCompile(`(?m)^\(cherry picked from commit ([0-9a-fA-F]{40})\)$`)
 
 func (s Service) Applied(ctx context.Context, base string, candidates []Commit) ([]Commit, error) {
-	basePatches, err := s.basePatchIDs(ctx, base)
-	if err != nil {
-		return nil, err
+	result := make([]Commit, len(candidates))
+	copy(result, candidates)
+	if len(result) == 0 {
+		return result, nil
 	}
+
 	picked, err := s.pickedHashes(ctx, base)
 	if err != nil {
 		return nil, err
 	}
-	result := make([]Commit, len(candidates))
-	copy(result, candidates)
+	remaining := make([]Commit, 0, len(result))
 	for i := range result {
 		if _, ok := picked[strings.ToLower(result[i].Hash)]; ok {
 			result[i].Applied = true
 			continue
 		}
-		patch, err := s.patchID(ctx, result[i].Hash)
-		if err != nil {
-			return nil, err
+		remaining = append(remaining, result[i])
+	}
+	if len(remaining) == 0 {
+		return result, nil
+	}
+
+	basePatches, err := s.basePatchIDs(ctx, base)
+	if err != nil {
+		return nil, err
+	}
+	candidatePatches, err := s.candidatePatchIDs(ctx, remaining)
+	if err != nil {
+		return nil, err
+	}
+	for i := range result {
+		if result[i].Applied {
+			continue
+		}
+		patch := candidatePatches[strings.ToLower(result[i].Hash)]
+		if patch == "" {
+			continue
 		}
 		_, result[i].Applied = basePatches[patch]
-		if patch == "" {
-			result[i].Applied = false
-		}
 	}
 	return result, nil
 }
 
 func (s Service) basePatchIDs(ctx context.Context, base string) (map[string]struct{}, error) {
-	logOut, err := s.run(ctx, "log", base, "--no-merges", "-p", "--pretty=format:%H")
-	if err != nil {
-		return nil, err
-	}
-	out, err := s.runner().RunInput(ctx, s.Dir, logOut, "patch-id", "--stable")
+	out, err := s.runPipeline(ctx,
+		[]string{"log", base, "--no-merges", "-p", "--pretty=format:%H"},
+		[]string{"patch-id", "--stable"},
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -306,6 +318,32 @@ func (s Service) basePatchIDs(ctx context.Context, base string) (map[string]stru
 		}
 	}
 	return ids, nil
+}
+
+func (s Service) candidatePatchIDs(ctx context.Context, candidates []Commit) (map[string]string, error) {
+	result := make(map[string]string, len(candidates))
+	if len(candidates) == 0 {
+		return result, nil
+	}
+	args := []string{"show", "--format=%H", "--patch"}
+	for _, commit := range candidates {
+		args = append(args, commit.Hash)
+	}
+	show, err := s.run(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	out, err := s.runner().RunInput(ctx, s.Dir, show, "patch-id", "--stable")
+	if err != nil {
+		return nil, err
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			result[strings.ToLower(fields[1])] = fields[0]
+		}
+	}
+	return result, nil
 }
 
 func (s Service) patchID(ctx context.Context, hash string) (string, error) {
@@ -325,7 +363,7 @@ func (s Service) patchID(ctx context.Context, hash string) (string, error) {
 }
 
 func (s Service) pickedHashes(ctx context.Context, base string) (map[string]struct{}, error) {
-	out, err := s.run(ctx, "log", base, "--format=%B%x00")
+	out, err := s.run(ctx, "log", base, "--format=%B%x00", "--fixed-strings", "--grep=cherry picked from commit")
 	if err != nil {
 		return nil, err
 	}
