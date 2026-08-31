@@ -119,6 +119,11 @@ func (a *Application) Run(ctx context.Context, args []string) error {
 		a.Build = buildinfo.Current()
 	}
 
+	ctx, args, verbose := stripVerboseFlag(ctx, args)
+	if verbose {
+		restoreGit := a.enableVerboseGit()
+		defer restoreGit()
+	}
 	global, command, rest, err := parseRoot(args)
 	if err != nil {
 		return err
@@ -155,7 +160,7 @@ func (a *Application) Run(ctx context.Context, args []string) error {
 	case "update":
 		return a.update(ctx, global, rest)
 	case "doctor":
-		return a.doctor(ctx, global, rest)
+		return a.doctorEnhanced(ctx, global, rest)
 	default:
 		return clierror.New(clierror.Usage, "unknown command %q\nRun 'kit help' for usage.", command)
 	}
@@ -1069,6 +1074,7 @@ Global options:
   --json         Print machine-readable output where supported
   --no-color     Disable ANSI colors
   --yes          Skip mutation confirmation
+  --verbose      Print sanitized Git and provider diagnostics to stderr
 `)
 }
 
