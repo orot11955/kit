@@ -169,6 +169,21 @@ nav a:hover { color: var(--accent); }
   text-transform: uppercase;
 }
 
+.deploy-badge {
+  display: inline-flex;
+  width: fit-content;
+  margin: 0 0 1.25rem;
+  padding: .3rem .55rem;
+  border: 1px solid rgba(103, 232, 211, .45);
+  border-radius: 999px;
+  color: var(--cyan);
+  font-family: var(--mono);
+  font-size: .7rem;
+  font-weight: 750;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
 .status-dot {
   display: inline-block;
   width: 7px;
