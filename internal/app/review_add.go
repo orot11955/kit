@@ -97,6 +97,7 @@ func (a *Application) reviewAdd(ctx context.Context, global globalOptions, args 
 		return err
 	}
 	c := s.WorkflowConfig(ctx)
+	pushRemote := c.PushRemoteName()
 	branch, err := resolveReviewBranch(ctx, s, opts.branch)
 	if err != nil {
 		return err
@@ -104,6 +105,9 @@ func (a *Application) reviewAdd(ctx context.Context, global globalOptions, args 
 	state, err := reviewstate.Load(ctx, s, branch)
 	if err != nil {
 		return clierror.Wrap(clierror.Failure, err, "load review state")
+	}
+	if state.Remote != "" && state.Remote != pushRemote {
+		return clierror.New(clierror.Conflict, "review was published to %s, but configured push remote is %s", state.Remote, pushRemote)
 	}
 	state, refreshed, err := a.refreshReviewState(ctx, s, state)
 	if err != nil {
@@ -138,6 +142,11 @@ func (a *Application) reviewAdd(ctx context.Context, global globalOptions, args 
 	if err := s.Fetch(ctx, c.Remote); err != nil {
 		return clierror.Wrap(clierror.Failure, err, "fetch %s", c.Remote)
 	}
+	if pushRemote != c.Remote {
+		if err := s.Fetch(ctx, pushRemote); err != nil {
+			return clierror.Wrap(clierror.Failure, err, "fetch %s", pushRemote)
+		}
+	}
 	remoteBase := c.Remote + "/" + c.Base
 	if err := s.VerifyRevision(ctx, remoteBase); err != nil {
 		return clierror.Wrap(clierror.Failure, err, "remote base %s is unavailable", remoteBase)
@@ -163,18 +172,18 @@ func (a *Application) reviewAdd(ctx context.Context, global globalOptions, args 
 	if !localExists {
 		return clierror.New(clierror.Conflict, "local review branch %q is missing", branch)
 	}
-	remoteExists, err := s.RemoteTrackingBranchExists(ctx, c.Remote, branch)
+	remoteExists, err := s.RemoteTrackingBranchExists(ctx, pushRemote, branch)
 	if err != nil {
 		return clierror.Wrap(clierror.Failure, err, "check remote review branch")
 	}
 	if !remoteExists {
-		return clierror.New(clierror.Conflict, "remote review branch %s/%s is missing", c.Remote, branch)
+		return clierror.New(clierror.Conflict, "remote review branch %s/%s is missing", pushRemote, branch)
 	}
 	localTip, err := s.RevisionHash(ctx, branch)
 	if err != nil {
 		return clierror.Wrap(clierror.Failure, err, "read local review branch tip")
 	}
-	remoteTip, err := s.RevisionHash(ctx, c.Remote+"/"+branch)
+	remoteTip, err := s.RevisionHash(ctx, pushRemote+"/"+branch)
 	if err != nil {
 		return clierror.Wrap(clierror.Failure, err, "read remote review branch tip")
 	}
@@ -245,15 +254,13 @@ func (a *Application) reviewAdd(ctx context.Context, global globalOptions, args 
 			return clierror.Wrap(clierror.Failure, err, "switch to review branch %s", branch)
 		}
 	}
-	restore := func() error {
-		return restoreReconcileCheckout(ctx, s, originalHash, originalBranch)
-	}
+	restore := func() error { return restoreReconcileCheckout(ctx, s, originalHash, originalBranch) }
 	upstream, err := s.Upstream(ctx)
 	if err != nil {
 		_ = restore()
 		return clierror.Wrap(clierror.Failure, err, "read review branch upstream")
 	}
-	expectedUpstream := c.Remote + "/" + branch
+	expectedUpstream := pushRemote + "/" + branch
 	if upstream != expectedUpstream {
 		_ = restore()
 		return clierror.New(clierror.Conflict, "review branch tracks %q, expected %q", upstream, expectedUpstream)
@@ -276,7 +283,7 @@ func (a *Application) reviewAdd(ctx context.Context, global globalOptions, args 
 	if err != nil {
 		return clierror.Wrap(clierror.Failure, err, "read updated review branch tip")
 	}
-	if err := s.PushCurrent(ctx, c.Remote, branch, false); err != nil {
+	if err := s.PushCurrent(ctx, pushRemote, branch, false); err != nil {
 		_ = restore()
 		return clierror.Wrap(clierror.Failure, err, "push %s did not finish; local review branch was kept at %s, so verify the remote before retrying", branch, newTip)
 	}
@@ -307,7 +314,7 @@ func (a *Application) reviewAdd(ctx context.Context, global globalOptions, args 
 		return writeJSON(a.IO.Out, result)
 	}
 	r := a.renderer(opts.globalOptions)
-	r.Success("Push", fmt.Sprintf("%s/%s · %s", c.Remote, branch, newTip[:10]))
+	r.Success("Push", fmt.Sprintf("%s/%s · %s", pushRemote, branch, newTip[:10]))
 	r.Success("Review", fmt.Sprintf("#%d에 %d개 commit 추가", state.ReviewNumber, len(selected)))
 	r.Next("PR merge 후 kit review finish")
 	return nil

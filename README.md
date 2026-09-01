@@ -12,9 +12,10 @@
 - `kit backup`: sync/recovery backup 조회·복원·정리
 - `kit doctor`: local/network/recovery 진단
 - `kit worktree`, `kit branch-clean`: worktree와 안전한 local review branch 정리
+- `kit port`, `kit process`: local port/process 조회와 안전한 signal mutation
 - `kit update`: 검증된 self-update, update check, previous binary rollback
 
-실행 중 필요한 외부 개발 도구는 system `git`이다. commit selector는 binary에 포함된 terminal UI를 사용하므로 별도 `fzf` 설치가 필요하지 않다.
+실행 중 필요한 핵심 외부 도구는 system `git`이다. `kit port`는 `lsof`를 사용한다. macOS에는 기본 제공되며 Ubuntu에서는 필요 시 `sudo apt install lsof`로 설치한다. commit selector는 binary에 포함된 terminal UI를 사용하므로 별도 `fzf` 설치가 필요하지 않다.
 
 ## 지원 환경
 
@@ -52,7 +53,7 @@ kit config init
 kit config bootstrap
 ```
 
-`bootstrap`은 configured remote를 fetch하고 missing local `main`/`develop`을 remote ref에서 만든다. `work`가 없으면 `develop`에서 만든다. 기존 `work`를 덮어쓰지 않으며 `origin/work`가 존재하면 local-only queue 계약 위반으로 중단한다.
+`bootstrap`은 configured `git.remote`를 fetch하고 missing local `main`/`develop`을 remote ref에서 만든다. `work`가 없으면 `develop`에서 만든다. 기존 `work`를 덮어쓰지 않으며 configured remote에 `work`가 존재하면 local-only queue 계약 위반으로 중단한다.
 
 Gitea review API를 사용하려면 token을 한 번 등록한다.
 
@@ -62,6 +63,34 @@ kit auth status gitea --host git.company.example
 ```
 
 macOS는 Keychain, Ubuntu는 Secret Service를 기본 저장소로 사용한다. `--store file`은 명시적인 fallback이며 credential file은 제한된 권한으로 저장한다. token은 status/list/JSON/log에 출력하지 않는다.
+
+### Gitea fork에서 upstream PR 만들기
+
+기본 same-repository workflow에서는 `git.remote` 하나만 사용하면 된다.
+
+fork에서 upstream으로 PR을 보내려면 remote 역할을 명시적으로 나눈다.
+
+```sh
+git remote add upstream git@git.company.example:team/project.git
+git remote add origin git@git.company.example:my-user/project.git
+
+kit config set git.remote upstream
+kit config set git.push-remote origin
+kit doctor --network
+```
+
+의미는 다음과 같다.
+
+```text
+git.remote       upstream/base sync + PR target
+git.push-remote  fork review branch push source
+```
+
+`git.push-remote`를 설정하지 않으면 자동으로 `git.remote`를 사용하므로 기존 repository 설정은 그대로 동작한다.
+
+fork workflow에서는 review branch를 fork remote에 push하고 Gitea upstream repository에 `<fork-owner>:<branch>`를 source로 PR을 생성한다. `review add`도 fork branch를 갱신하며, `review finish` cleanup은 saved published tip이 정확히 일치하는 fork branch만 삭제한다. upstream에 같은 이름의 branch가 있어도 삭제하지 않는다.
+
+현재 cross-repository review는 같은 Gitea host의 fork만 지원한다. 자세한 safety contract는 [docs/fork-review.md](docs/fork-review.md)를 참고한다.
 
 ## 권장 일상 workflow
 
@@ -86,10 +115,10 @@ kit review finish feat/login
 
 `review finish`는 provider에서 PR이 실제 `merged`인지 확인한 뒤 다음 순서로 동작한다.
 
-1. remote base fetch 및 fast-forward
+1. upstream base fetch 및 fast-forward
 2. PR 생성 시 저장한 source commit metadata로 squash merge를 reconcile
 3. 남은 `work` commit을 최신 base 위에 재구성
-4. exact published tip이 확인되는 Kit-managed local/remote review branch만 정리
+4. exact published tip이 확인되는 Kit-managed local/published remote review branch만 정리
 5. review state를 `synced`/`cleaned`로 기록
 
 일반 `kit sync`는 계속 Git-only다. provider API를 호출하지 않으며 PR lifecycle과 관계없이 base/work queue를 동기화해야 할 때 사용할 수 있다.
@@ -155,7 +184,7 @@ kit pick --abort
 
 ### PR 생성 / 재실행
 
-`kit pick`은 기본적으로 push 후 Gitea PR을 생성한다. 동일 source/base의 open PR이 이미 있으면 새 PR을 만들지 않고 기존 PR을 재사용한다.
+`kit pick`은 기본적으로 push 후 Gitea PR을 생성한다. 동일 source/base의 open PR이 이미 있으면 새 PR을 만들지 않고 기존 PR을 재사용한다. fork mode에서는 fork owner까지 일치해야 같은 PR로 재사용한다.
 
 현재 branch를 직접 submit할 수도 있다.
 
@@ -176,7 +205,7 @@ kit review add feat/login --all
 - review state가 존재하고 provider PR이 `open`
 - branch가 Kit-created marker를 가짐
 - working tree clean
-- local branch/upstream/remote/provider tip이 저장된 `PublishedTip`과 일치
+- local branch/upstream/published remote/provider tip이 저장된 `PublishedTip`과 일치
 - base/source가 최신 상태
 - 선택 commit이 현재 pending work commit
 
@@ -190,7 +219,7 @@ kit review list
 kit review list --refresh
 ```
 
-`--refresh`는 저장된 active review를 provider에서 갱신한다.
+`--refresh`는 저장된 active review를 provider에서 갱신한다. saved push remote나 target repository가 현재 설정과 달라지면 provider mutation/refresh를 중단한다.
 
 ### merge 완료
 
@@ -216,7 +245,7 @@ kit sync
 
 sync는:
 
-- configured remote fetch/prune
+- configured `git.remote` fetch/prune
 - base fast-forward
 - 기존 work backup 생성
 - 최신 base에서 direct first-parent pending commit 재구성
@@ -267,7 +296,7 @@ remote Git과 Gitea API까지 read-only 진단:
 kit doctor --network
 ```
 
-`--network`는 `git ls-remote`로 stable/base를 확인하고 local-only source branch가 remote에 없는지 검사한 뒤 Gitea repository API를 ping한다. fetch로 local tracking ref를 변경하지 않는다.
+`--network`는 `git ls-remote`로 upstream stable/base를 확인하고 local-only source branch가 upstream remote에 없는지 검사한 뒤 Gitea target repository API를 ping한다. `git.push-remote`가 설정된 경우 fork source/target topology도 검사한다. fetch로 local tracking ref를 변경하지 않는다.
 
 실행 command를 진단해야 할 때:
 
@@ -317,6 +346,36 @@ kit branch-clean --delete --yes --json
 
 remote branch는 이 명령이 삭제하지 않는다.
 
+## port / process
+
+port를 사용 중인 local process 조회:
+
+```sh
+kit port 3000
+kit port 3000 --json
+```
+
+TCP listener와 UDP binding을 보여준다.
+
+해당 port를 사용하는 process에 signal 전송:
+
+```sh
+kit port kill 3000
+kit port kill 3000 --signal KILL --yes
+```
+
+PID 직접 조회/종료:
+
+```sh
+kit process 1234
+kit process 1234 --json
+kit process kill 1234 --signal TERM
+```
+
+지원 signal은 `TERM`, `KILL`, `INT`, `HUP`, `QUIT`이며 기본은 `TERM`이다. PID 1 이하와 현재 실행 중인 kit process에는 signal을 보내지 않는다. mutation JSON은 `--yes`가 필요하다.
+
+`port`/`process`는 Git repository 밖에서도 사용할 수 있다.
+
 ## update / rollback
 
 최신 version 확인만:
@@ -354,6 +413,8 @@ kit review list --refresh --json
 kit review finish feat/bot --yes --json
 kit doctor --network --json
 kit doctor --recovery --json
+kit port 3000 --json
+kit process 1234 --json
 kit update --check --json
 ```
 
@@ -375,7 +436,7 @@ kit config set git.allow-insecure-http true
 
 이 경우 API token이 평문 네트워크로 전송되므로 HTTPS reverse proxy 사용을 우선한다. kit는 HTTPS에서 HTTP로 자동 downgrade하지 않는다.
 
-`KIT_GITEA_TOKEN`과 `KIT_GITEA_HOST` 환경 override는 반드시 함께 설정해야 한다. Git push credential과 Gitea API token은 서로 별개다.
+`KIT_GITEA_TOKEN`과 `KIT_GITEA_HOST` 환경 override는 반드시 함께 설정해야 한다. Git push credential과 Gitea API token은 서로 별개다. fork workflow에서도 review API credential은 upstream target host에 바인딩되고 Git push credential은 `git.push-remote`에 사용된다.
 
 ## 개발 / CI
 

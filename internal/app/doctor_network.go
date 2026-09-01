@@ -72,6 +72,23 @@ func (a *Application) doctorEnhanced(ctx context.Context, global globalOptions, 
 		result.OK = false
 	}
 
+	if config.PushRemote != "" {
+		topologyCheck := doctorCheck{Name: "review source"}
+		repositories, topologyErr := resolveReviewRepositories(ctx, service, config)
+		if topologyErr != nil {
+			topologyCheck.Message = topologyErr.Error()
+			result.OK = false
+		} else {
+			topologyCheck.OK = true
+			if repositories.Fork {
+				topologyCheck.Message = fmt.Sprintf("%s %s/%s → %s %s/%s", repositories.PushRemote, repositories.Source.Owner, repositories.Source.Name, config.Remote, repositories.Target.Owner, repositories.Target.Name)
+			} else {
+				topologyCheck.Message = repositories.PushRemote + " resolves to the review target repository"
+			}
+		}
+		result.Checks = append(result.Checks, topologyCheck)
+	}
+
 	if synced, syncErr := service.IsAncestor(ctx, config.Base, config.Source); syncErr == nil {
 		message := "source contains base"
 		if !synced {
