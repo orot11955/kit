@@ -29,7 +29,10 @@ check:
 		deploy/tests/ssh-wrapper.sh \
 		deploy/tests/activate-integration.sh \
 		deploy/apps-prod/deploy.sh \
-		deploy/deploy-manual.sh
+		deploy/deploy-manual.sh \
+		scripts/github-protection.sh
+	python3 -m json.tool .github/protection/main.json >/dev/null
+	python3 -m json.tool .github/protection/develop.json >/dev/null
 	bash deploy/tests/ssh-wrapper.sh
 
 release:
