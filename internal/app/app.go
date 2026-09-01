@@ -2,16 +2,12 @@ package app
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
-
-	"golang.org/x/term"
 
 	"kit/internal/auth"
 	"kit/internal/buildinfo"
@@ -20,7 +16,6 @@ import (
 	"kit/internal/hosting"
 	"kit/internal/review"
 	"kit/internal/selector"
-	"kit/internal/ui"
 	"kit/internal/update"
 )
 
@@ -252,143 +247,4 @@ func verifyRevisions(ctx context.Context, service gitservice.Service, revisions 
 		}
 	}
 	return nil
-}
-
-func (a *Application) version(global globalOptions, args []string) error {
-	for len(args) > 0 {
-		if args[0] == "-h" || args[0] == "--help" {
-			fmt.Fprintln(a.IO.Out, "Usage: kit version [--json]")
-			return nil
-		}
-		consumed, err := parseGlobal(&global, args)
-		if err != nil {
-			return err
-		}
-		if consumed == 0 {
-			return clierror.New(clierror.Usage, "unknown version option %q", args[0])
-		}
-		args = args[consumed:]
-	}
-	if global.json {
-		return writeJSON(a.IO.Out, a.Build)
-	}
-	fmt.Fprintf(a.IO.Out, "kit %s\ncommit: %s\nbuilt: %s\ntarget: %s\n", a.Build.Version, a.Build.Commit, a.Build.BuildDate, a.Build.Target)
-	return nil
-}
-
-func (a *Application) update(ctx context.Context, global globalOptions, args []string) error {
-	checkOnly := false
-	rollback := false
-	for len(args) > 0 {
-		if args[0] == "-h" || args[0] == "--help" {
-			fmt.Fprintln(a.IO.Out, "Usage: kit update [--check | --rollback] [--json]")
-			return nil
-		}
-		switch args[0] {
-		case "--check":
-			checkOnly = true
-			args = args[1:]
-			continue
-		case "--rollback":
-			rollback = true
-			args = args[1:]
-			continue
-		}
-		consumed, err := parseGlobal(&global, args)
-		if err != nil {
-			return err
-		}
-		if consumed == 0 {
-			return clierror.New(clierror.Usage, "unknown update option %q", args[0])
-		}
-		args = args[consumed:]
-	}
-	if checkOnly && rollback {
-		return clierror.New(clierror.Usage, "--check and --rollback cannot be combined")
-	}
-	result, err := a.Update(ctx, update.Config{
-		Current:    a.Build,
-		Executable: a.ExecPath,
-		CheckOnly:  checkOnly,
-		Rollback:   rollback,
-	})
-	if err != nil {
-		return clierror.Wrap(clierror.Failure, err, "update failed")
-	}
-	if global.json {
-		return writeJSON(a.IO.Out, result)
-	}
-	if rollback {
-		fmt.Fprintf(a.IO.Out, "kit %s → %s 롤백 완료\n", result.Current, result.Previous)
-		return nil
-	}
-	if checkOnly {
-		if result.UpdateAvailable {
-			fmt.Fprintf(a.IO.Out, "업데이트 가능: kit %s → %s\n", result.Current, result.Latest)
-		} else {
-			fmt.Fprintf(a.IO.Out, "이미 최신 버전입니다: %s\n", result.Current)
-		}
-		return nil
-	}
-	if result.Updated {
-		fmt.Fprintf(a.IO.Out, "kit %s → %s 업데이트 완료\n", result.Current, result.Latest)
-	} else {
-		fmt.Fprintf(a.IO.Out, "이미 최신 버전입니다: %s\n", result.Current)
-	}
-	return nil
-}
-
-func writeJSON(w io.Writer, value any) error {
-	encoder := json.NewEncoder(w)
-	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(value); err != nil {
-		return clierror.Wrap(clierror.Failure, err, "write JSON output")
-	}
-	return nil
-}
-
-func isTerminal(w io.Writer) bool {
-	file, ok := w.(*os.File)
-	return ok && term.IsTerminal(int(file.Fd()))
-}
-
-func (a *Application) renderer(global globalOptions) ui.Renderer {
-	color := !global.noColor && os.Getenv("NO_COLOR") == "" && isTerminal(a.IO.Out)
-	return ui.Renderer{Writer: a.IO.Out, Color: color}
-}
-
-func printRootHelp(w io.Writer) {
-	fmt.Fprint(w, `kit — repeatable developer workflow tools
-
-Usage:
-  kit [global options] <command> [arguments]
-
-Daily workflow:
-  compare   Show pending work commits and already-applied work
-  pick      Select commits, push a branch, and create a PR
-
-Advanced and recovery:
-  status    Show detailed repository, queue, and tracked-review state
-  sync      Update develop and rebuild work from first-parent pending commits
-  review    Advanced review inspection and recovery commands
-  backup    List, create, restore, and clean work backups
-
-Setup and maintenance:
-  auth      Gitea credential storage commands
-  config    Repository-local workflow settings
-  doctor    Check dependencies and repository configuration
-  update    Update the installed kit binary
-  version   Print build information
-
-Compatibility:
-  git       Legacy namespace; existing 'kit git ...' commands remain supported
-  self      Legacy namespace for version, update, and doctor
-
-Global options:
-  --cwd <path>   Run Git commands in another directory
-  --json         Print machine-readable output where supported
-  --no-color     Disable ANSI colors
-  --yes          Skip mutation confirmation
-  --verbose      Print sanitized Git and provider diagnostics to stderr
-`)
 }
