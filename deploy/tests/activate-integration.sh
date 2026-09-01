@@ -118,6 +118,10 @@ EOF
 chown root:root "$DEPLOY_CONFIG"
 chmod 0644 "$DEPLOY_CONFIG"
 
+clear_origin() {
+  find "$origin_root" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+}
+
 make_site_tree() {
   local directory=$1 commit=$2
   mkdir -p "$directory"
@@ -136,9 +140,9 @@ EOF
   chmod 0755 "$directory/install.sh"
 }
 
-sync_origin() {
+sync_origin_site() {
   local directory=$1
-  find "$origin_root" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+  clear_origin
   cp -a "$directory"/. "$origin_root"/
 }
 
@@ -149,17 +153,56 @@ make_site_archive() {
   printf '%s' "$archive"
 }
 
-upload_site() {
-  local commit=$1 archive=$2
+make_release_tree() {
+  local directory=$1 version=$2
+  mkdir -p "$directory"
+  printf 'darwin binary %s\n' "$version" >"$directory/kit_darwin_arm64"
+  printf 'linux binary %s\n' "$version" >"$directory/kit_linux_amd64"
+  (
+    cd "$directory"
+    sha256sum kit_darwin_arm64 kit_linux_amd64 >checksums.txt
+  )
+  printf '%s\n' "$version" >"$directory/version.txt"
+  cat >"$directory/release.json" <<EOF
+{
+  "schema_version": 1,
+  "version": "$version",
+  "build": "aaaaaaaa",
+  "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "published_at": "2026-09-01T00:00:00Z",
+  "downloads": {}
+}
+EOF
+}
+
+sync_origin_release() {
+  local directory=$1 version=$2
+  clear_origin
+  mkdir -p "$origin_root/downloads/$version"
+  cp "$directory/kit_darwin_arm64" "$directory/kit_linux_amd64" "$directory/checksums.txt" \
+    "$origin_root/downloads/$version/"
+  cp "$directory/version.txt" "$directory/release.json" "$origin_root/"
+}
+
+make_release_archive() {
+  local directory=$1 version=$2 archive
+  archive="$tmp/upload-release-$version.tar.gz"
+  tar -C "$directory" -czf "$archive" \
+    kit_darwin_arm64 kit_linux_amd64 checksums.txt version.txt release.json
+  printf '%s' "$archive"
+}
+
+upload() {
+  local operation=$1 identifier=$2 archive=$3
   runuser -u "$DEPLOY_USER" -- env \
-    SSH_ORIGINAL_COMMAND="upload-site $commit" \
+    SSH_ORIGINAL_COMMAND="$operation $identifier" \
     SSH_CONNECTION="$private_ip 54321 $private_ip 22" \
     "$SSH_WRAPPER" gitea <"$archive"
 }
 
-rollback_site() {
-  local commit=$1
-  runuser -u "$DEPLOY_USER" -- "$ACTIVATOR" rollback site "$commit"
+rollback() {
+  local kind=$1 identifier=$2
+  runuser -u "$DEPLOY_USER" -- "$ACTIVATOR" rollback "$kind" "$identifier"
 }
 
 assert_current_site() {
@@ -169,6 +212,15 @@ assert_current_site() {
     fail "current-site points to $(readlink "$KIT_ROOT/current-site"), expected sites/$commit"
   [[ -d $KIT_ROOT/sites/$commit && ! -L $KIT_ROOT/sites/$commit ]] || \
     fail "site directory is missing for $commit"
+}
+
+assert_current_release() {
+  local version=$1
+  [[ -L $KIT_ROOT/current-release ]] || fail "current-release is not a symlink"
+  [[ $(readlink "$KIT_ROOT/current-release") == "releases/$version" ]] || \
+    fail "current-release points to $(readlink "$KIT_ROOT/current-release"), expected releases/$version"
+  [[ -d $KIT_ROOT/releases/$version && ! -L $KIT_ROOT/releases/$version ]] || \
+    fail "release directory is missing for $version"
 }
 
 assert_incoming_empty() {
@@ -187,36 +239,32 @@ make_site_tree "$site1" "$commit1"
 make_site_tree "$site2" "$commit2"
 make_site_tree "$site3" "$commit3"
 
-sync_origin "$site1"
+sync_origin_site "$site1"
 archive1=$(make_site_archive "$site1" "$commit1")
-upload_site "$commit1" "$archive1"
+upload upload-site "$commit1" "$archive1"
 assert_current_site "$commit1"
 assert_incoming_empty
 cmp -s "$KIT_ROOT/sites/$commit1/index.html" "$site1/index.html" || fail "activated site content differs"
 [[ $(stat -c '%U' "$KIT_ROOT/sites/$commit1") == "$DEPLOY_USER" ]] || fail "activated site is not owned by deploy user"
 
-sync_origin "$site2"
+sync_origin_site "$site2"
 archive2=$(make_site_archive "$site2" "$commit2")
-upload_site "$commit2" "$archive2"
+upload upload-site "$commit2" "$archive2"
 assert_current_site "$commit2"
 assert_incoming_empty
 
-sync_origin "$site1"
-rollback_site "$commit1"
+sync_origin_site "$site1"
+rollback site "$commit1"
 assert_current_site "$commit1"
 
-# A valid new upload must not stay active when the configured origin still
-# serves the previous deployment. The activator should restore the old link and
-# the forced-command wrapper should clean its incoming archive on failure.
 archive3=$(make_site_archive "$site3" "$commit3")
-if upload_site "$commit3" "$archive3"; then
+if upload upload-site "$commit3" "$archive3"; then
   fail "origin mismatch deployment unexpectedly succeeded"
 fi
 assert_current_site "$commit1"
 assert_incoming_empty
 [[ ! -e $KIT_ROOT/sites/$commit3 ]] || fail "failed origin verification left a new site directory"
 
-# Exercise archive traversal rejection through the same forced-command path.
 malicious="$tmp/upload-site-$commit4.tar.gz"
 python3 - "$malicious" <<'PY'
 import io
@@ -230,7 +278,7 @@ with tarfile.open(path, "w:gz") as archive:
     info.size = len(data)
     archive.addfile(info, io.BytesIO(data))
 PY
-if upload_site "$commit4" "$malicious"; then
+if upload upload-site "$commit4" "$malicious"; then
   fail "traversal archive unexpectedly succeeded"
 fi
 assert_current_site "$commit1"
@@ -238,4 +286,43 @@ assert_incoming_empty
 [[ ! -e $KIT_ROOT/sites/$commit4 ]] || fail "traversal archive created a site destination"
 [[ ! -e $KIT_ROOT/escape && ! -e /srv/data/apps/kit/escape ]] || fail "traversal archive escaped the staging directory"
 
-echo "activate integration: forced-command upload, site activation, rollback, origin failure rollback, and traversal rejection passed"
+version1=v1.0.0
+version2=v1.0.1
+version3=v1.0.2
+release1="$tmp/release1"
+release2="$tmp/release2"
+release3="$tmp/release3"
+make_release_tree "$release1" "$version1"
+make_release_tree "$release2" "$version2"
+make_release_tree "$release3" "$version3"
+
+sync_origin_release "$release1" "$version1"
+release_archive1=$(make_release_archive "$release1" "$version1")
+upload upload-release "$version1" "$release_archive1"
+assert_current_release "$version1"
+assert_incoming_empty
+
+sync_origin_release "$release2" "$version2"
+release_archive2=$(make_release_archive "$release2" "$version2")
+upload upload-release "$version2" "$release_archive2"
+assert_current_release "$version2"
+assert_incoming_empty
+
+sync_origin_release "$release1" "$version1"
+rollback release "$version1"
+assert_current_release "$version1"
+
+# Allow artifact verification for v1.0.2, then deliberately serve stale top-level
+# metadata. This forces failure after current-release has moved and verifies that
+# the activator restores the previous symlink and removes the failed release.
+sync_origin_release "$release3" "$version3"
+cp "$release1/version.txt" "$release1/release.json" "$origin_root/"
+release_archive3=$(make_release_archive "$release3" "$version3")
+if upload upload-release "$version3" "$release_archive3"; then
+  fail "release metadata mismatch unexpectedly succeeded"
+fi
+assert_current_release "$version1"
+assert_incoming_empty
+[[ ! -e $KIT_ROOT/releases/$version3 ]] || fail "failed release metadata verification left a release directory"
+
+echo "activate integration: forced-command site/release activation, rollback, origin failure rollback, and traversal rejection passed"
