@@ -23,6 +23,7 @@ check:
 	sh -n install.sh
 	bash -n \
 		deploy/activate.sh \
+		deploy/activate-entrypoint.sh \
 		deploy/generate-release-metadata.sh \
 		deploy/rollback.sh \
 		deploy/ssh-wrapper.sh \
