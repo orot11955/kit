@@ -144,5 +144,35 @@ func TestCleanupFinishedForkReviewDeletesOnlyPushRemoteBranch(t *testing.T) {
 	}
 }
 
+func TestCleanupFinishedForkReviewRejectsRemoteChangeBeforeLocalDeletion(t *testing.T) {
+	dir := appRepository(t)
+	origin := filepath.Join(t.TempDir(), "origin.git")
+	other := filepath.Join(t.TempDir(), "other.git")
+	gitCommand(t, "", "init", "--bare", origin)
+	gitCommand(t, "", "init", "--bare", other)
+	gitCommand(t, dir, "remote", "add", "origin", origin)
+	gitCommand(t, dir, "remote", "add", "other", other)
+	gitCommand(t, dir, "branch", "work", "develop")
+	gitCommand(t, dir, "branch", "feat/saved", "develop")
+	service := gitservice.Service{Dir: dir}
+	if err := service.MarkKitCreatedBranch(context.Background(), "feat/saved"); err != nil {
+		t.Fatal(err)
+	}
+	tip := gitCommandOutput(t, dir, "rev-parse", "feat/saved")
+	config := gitservice.DefaultWorkflowConfig()
+	config.PushRemote = "other"
+	state := reviewstate.State{Remote: "origin", Branch: "feat/saved", PublishedTip: tip}
+	localRemoved, remoteRemoved, err := cleanupFinishedReviewBranch(context.Background(), service, config, state, true)
+	if err == nil {
+		t.Fatal("expected saved/config push remote mismatch")
+	}
+	if localRemoved || remoteRemoved {
+		t.Fatalf("cleanup mutated before rejecting mismatch: local=%v remote=%v", localRemoved, remoteRemoved)
+	}
+	if !commandSucceeds(dir, "show-ref", "--verify", "--quiet", "refs/heads/feat/saved") {
+		t.Fatal("local review branch was deleted before push remote mismatch rejection")
+	}
+}
+
 var _ review.Client = (*recordingForkReviewClient)(nil)
 var _ review.ForkClient = (*recordingForkReviewClient)(nil)
