@@ -141,7 +141,8 @@ sync_origin() {
 }
 
 make_site_archive() {
-  local directory=$1 commit=$2 archive="$KIT_ROOT/incoming/site-$commit.tar.gz"
+  local directory=$1 commit=$2 archive
+  archive="$KIT_ROOT/incoming/site-$commit.tar.gz"
   tar -C "$directory" -czf "$archive" index.html styles.css app.js favicon.svg install.sh
   chown "$DEPLOY_USER:$DEPLOY_USER" "$archive"
   chmod 0600 "$archive"
