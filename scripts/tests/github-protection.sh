@@ -41,8 +41,12 @@ while (($# > 0)); do
   esac
 done
 
-[[ -n $output && -n $url ]] || exit 91
-branch=${url##*/}
+[[ -n $output && -n $url ]] || {
+  echo "fake curl: output or URL is missing" >&2
+  exit 91
+}
+endpoint=${url%/protection}
+branch=${endpoint##*/}
 if [[ -n ${FAKE_CURL_LOG:-} ]]; then
   printf '%s %s\n' "$method" "$url" >>"$FAKE_CURL_LOG"
 fi
@@ -51,10 +55,9 @@ reviews='null'
 conversation=false
 if [[ $branch == main ]]; then
   reviews='{"dismiss_stale_reviews":true,"require_code_owner_reviews":false,"required_approving_review_count":0,"require_last_push_approval":false}'
-  # Strip the shell-escaping backslashes before embedding the object into JSON.
-  reviews=${reviews//\\"/"}
   conversation=true
 elif [[ $branch != develop ]]; then
+  echo "fake curl: unexpected branch endpoint: $url" >&2
   exit 92
 fi
 
