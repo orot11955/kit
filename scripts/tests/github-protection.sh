@@ -94,18 +94,21 @@ chmod 0755 "$tmp/bin/curl"
 export PATH="$tmp/bin:$PATH"
 export KIT_GITHUB_ADMIN_TOKEN=test-token
 
-if ! "$repo_root/scripts/github-protection.sh" --check --repo orot11955/kit >/dev/null; then
+echo "github-protection test: matching check"
+if ! "$repo_root/scripts/github-protection.sh" --check --repo orot11955/kit; then
   echo "github-protection test: matching protection check failed" >&2
   exit 1
 fi
 
+echo "github-protection test: drift detection"
 if FAKE_PROTECTION_MISMATCH=1 "$repo_root/scripts/github-protection.sh" --check --repo orot11955/kit >/dev/null 2>&1; then
   echo "github-protection test: drift was not detected" >&2
   exit 1
 fi
 
+echo "github-protection test: apply/read-back"
 log="$tmp/curl.log"
-if ! FAKE_CURL_LOG="$log" "$repo_root/scripts/github-protection.sh" --apply --repo orot11955/kit >/dev/null; then
+if ! FAKE_CURL_LOG="$log" "$repo_root/scripts/github-protection.sh" --apply --repo orot11955/kit; then
   echo "github-protection test: apply/read-back failed" >&2
   exit 1
 fi
