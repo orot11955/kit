@@ -145,6 +145,18 @@ func cleanupFinishedReviewBranch(ctx context.Context, service gitservice.Service
 	if !managed || state.PublishedTip == "" {
 		return false, false, nil
 	}
+
+	pushRemote := state.Remote
+	if pushRemote == "" {
+		pushRemote = config.PushRemoteName()
+	}
+	if state.Remote != "" && state.Remote != config.PushRemoteName() {
+		return false, false, fmt.Errorf("refusing finished review cleanup: saved push remote %q differs from configured push remote %q", state.Remote, config.PushRemoteName())
+	}
+	if _, remoteErr := service.RemoteURL(ctx, pushRemote); remoteErr != nil {
+		return false, false, fmt.Errorf("refusing finished review cleanup: read push remote %q: %w", pushRemote, remoteErr)
+	}
+
 	localExists, err := service.LocalBranchExists(ctx, state.Branch)
 	if err != nil {
 		return false, false, err
@@ -172,7 +184,7 @@ func cleanupFinishedReviewBranch(ctx context.Context, service gitservice.Service
 		_ = service.ClearKitCreatedBranch(ctx, state.Branch)
 		localRemoved = true
 	}
-	remoteRemoved, err = service.DeleteRemoteBranchIfMatches(ctx, config.Remote, state.Branch, state.PublishedTip)
+	remoteRemoved, err = service.DeleteRemoteBranchIfMatches(ctx, pushRemote, state.Branch, state.PublishedTip)
 	if err != nil {
 		return localRemoved, false, err
 	}

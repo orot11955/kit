@@ -195,12 +195,12 @@ func (a *Application) reviewSubmit(ctx context.Context, g globalOptions, o revie
 			return nil
 		}
 	}
-	repo, e := reviewRepository(ctx, s, c)
+	repositories, e := resolveReviewRepositories(ctx, s, c)
 	if e != nil {
 		return e
 	}
-	warnInsecureHTTP(ctx, a.IO.ErrOut, repo)
-	client, e := a.ReviewClient(repo)
+	warnInsecureHTTP(ctx, a.IO.ErrOut, repositories.Target)
+	client, e := a.ReviewClient(repositories.Target)
 	if e != nil {
 		return clierror.Wrap(clierror.Failure, e, "initialize review provider")
 	}
@@ -208,30 +208,20 @@ func (a *Application) reviewSubmit(ctx context.Context, g globalOptions, o revie
 	if e != nil {
 		return clierror.Wrap(clierror.Failure, e, "read branch upstream")
 	}
-	expected := c.Remote + "/" + branch
+	expected := repositories.PushRemote + "/" + branch
 	if upstream != "" && upstream != expected {
 		return clierror.New(clierror.Conflict, "current branch tracks %s, expected %s", upstream, expected)
 	}
 	if o.pushAttempted != nil {
 		*o.pushAttempted = true
 	}
-	if e = s.PushCurrent(ctx, c.Remote, branch, upstream == ""); e != nil {
+	if e = s.PushCurrent(ctx, repositories.PushRemote, branch, upstream == ""); e != nil {
 		return clierror.Wrap(clierror.Failure, e, "push %s", branch)
 	}
 
-	created := review.Review{}
-	reused := false
-	if finder, ok := client.(review.OpenFinder); ok {
-		created, reused, e = finder.FindOpen(ctx, branch, c.Base)
-		if e != nil {
-			return clierror.Wrap(clierror.Failure, e, "check for an existing PR after push; no new PR was attempted")
-		}
-	}
-	if !reused {
-		created, e = client.Create(ctx, review.CreateRequest{SourceBranch: branch, TargetBranch: c.Base, Title: title, Description: desc, Draft: o.draft, RemoveSourceBranch: o.removeSourceBranch})
-		if e != nil {
-			return clierror.Wrap(clierror.Failure, e, "create PR after push; local and remote branch %s were kept, so retrying review submit is safe after checking provider status", branch)
-		}
+	created, reused, e := findOrCreateReview(ctx, client, repositories, branch, c.Base, title, desc, o.draft, o.removeSourceBranch)
+	if e != nil {
+		return clierror.Wrap(clierror.Failure, e, "create or reuse PR after push; local and remote branch %s were kept, so retrying review submit is safe after checking provider status", branch)
 	}
 	if created.ID == "" || created.URL == "" || created.Number <= 0 {
 		return clierror.New(clierror.Failure, "provider returned incomplete PR metadata; local and remote branch %s were kept", branch)
@@ -246,7 +236,10 @@ func (a *Application) reviewSubmit(ctx context.Context, g globalOptions, o revie
 	if !o.embedded {
 		r.Command("review submit")
 	}
-	r.Success("Push", c.Remote+"/"+branch)
+	r.Success("Push", repositories.PushRemote+"/"+branch)
+	if repositories.Fork {
+		r.Field("Target", repositories.Target.Owner+"/"+repositories.Target.Name)
+	}
 	if reused {
 		r.Success("PR", fmt.Sprintf("기존 #%d 재사용 · %s", created.Number, created.URL))
 	} else {
@@ -464,7 +457,7 @@ func savePublishedReview(ctx context.Context, s gitservice.Service, c gitservice
 	state := reviewstate.State{
 		Stage:         reviewStage(item.Status),
 		Provider:      item.Provider,
-		Remote:        c.Remote,
+		Remote:        c.PushRemoteName(),
 		Branch:        branch,
 		SourceBranch:  c.Source,
 		TargetBranch:  c.Base,
@@ -495,12 +488,18 @@ func (a *Application) refreshReviewState(ctx context.Context, s gitservice.Servi
 		return state, false, nil
 	}
 	c := s.WorkflowConfig(ctx)
+	if state.Remote != "" && state.Remote != c.PushRemoteName() {
+		return state, false, fmt.Errorf("configured push remote %q does not match saved review push remote %q", c.PushRemoteName(), state.Remote)
+	}
 	repo, e := reviewRepository(ctx, s, c)
 	if e != nil {
 		return state, false, e
 	}
 	if state.Provider != "" && repo.Provider != state.Provider {
 		return state, false, fmt.Errorf("configured provider %q does not match saved review provider %q", repo.Provider, state.Provider)
+	}
+	if !reviewURLMatchesRepository(state.ReviewURL, repo) {
+		return state, false, fmt.Errorf("saved review URL does not match configured review target repository %s/%s", repo.Owner, repo.Name)
 	}
 	warnInsecureHTTP(ctx, a.IO.ErrOut, repo)
 	client, e := a.ReviewClient(repo)
