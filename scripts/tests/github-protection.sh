@@ -51,6 +51,8 @@ reviews='null'
 conversation=false
 if [[ $branch == main ]]; then
   reviews='{"dismiss_stale_reviews":true,"require_code_owner_reviews":false,"required_approving_review_count":0,"require_last_push_approval":false}'
+  # Strip the shell-escaping backslashes before embedding the object into JSON.
+  reviews=${reviews//\\"/"}
   conversation=true
 elif [[ $branch != develop ]]; then
   exit 92
@@ -89,7 +91,10 @@ chmod 0755 "$tmp/bin/curl"
 export PATH="$tmp/bin:$PATH"
 export KIT_GITHUB_ADMIN_TOKEN=test-token
 
-"$repo_root/scripts/github-protection.sh" --check --repo orot11955/kit >/dev/null
+if ! "$repo_root/scripts/github-protection.sh" --check --repo orot11955/kit >/dev/null; then
+  echo "github-protection test: matching protection check failed" >&2
+  exit 1
+fi
 
 if FAKE_PROTECTION_MISMATCH=1 "$repo_root/scripts/github-protection.sh" --check --repo orot11955/kit >/dev/null 2>&1; then
   echo "github-protection test: drift was not detected" >&2
@@ -97,7 +102,10 @@ if FAKE_PROTECTION_MISMATCH=1 "$repo_root/scripts/github-protection.sh" --check 
 fi
 
 log="$tmp/curl.log"
-FAKE_CURL_LOG="$log" "$repo_root/scripts/github-protection.sh" --apply --repo orot11955/kit >/dev/null
+if ! FAKE_CURL_LOG="$log" "$repo_root/scripts/github-protection.sh" --apply --repo orot11955/kit >/dev/null; then
+  echo "github-protection test: apply/read-back failed" >&2
+  exit 1
+fi
 for branch in main develop; do
   grep -Fq "PUT https://api.github.com/repos/orot11955/kit/branches/$branch/protection" "$log" || {
     echo "github-protection test: missing PUT for $branch" >&2
