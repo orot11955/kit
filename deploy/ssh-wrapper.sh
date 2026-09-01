@@ -78,24 +78,7 @@ fi
 archive_size=$(wc -c <"$archive")
 (( archive_size > 0 && archive_size <= MAX_ARCHIVE_BYTES )) || fail "archive size is invalid"
 
-# activate.sh historically returned 1 after a successful site activation because
-# its final release predicate was false. Do not broadly mask activator failures:
-# normalize only that exact status when the full site success postcondition is
-# already visible (archive consumed, exact current-site target, destination exists).
-if "$ACTIVATE_COMMAND" "$mode" "$identifier" "$archive"; then
-  :
-else
-  activate_status=$?
-  site_success=0
-  if [[ $mode == site && $activate_status -eq 1 && ! -e $archive && \
-        -L $KIT_ROOT/current-site && \
-        $(readlink "$KIT_ROOT/current-site" 2>/dev/null || true) == "sites/$identifier" && \
-        -d $KIT_ROOT/sites/$identifier && ! -L $KIT_ROOT/sites/$identifier ]]; then
-    site_success=1
-  fi
-  (( site_success == 1 )) || exit "$activate_status"
-fi
-
+"$ACTIVATE_COMMAND" "$mode" "$identifier" "$archive"
 archive=""
 logger -t kit-deploy \
   "identity=$identity source=$source_address operation=$operation identifier=$identifier completed" || true

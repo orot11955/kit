@@ -4,6 +4,7 @@ set -Eeuo pipefail
 
 readonly KIT_ROOT="/srv/data/apps/kit/data"
 readonly ACTIVATOR="/usr/local/libexec/kit-activate"
+readonly CORE_ACTIVATOR="/usr/local/libexec/kit-activate-core"
 readonly SSH_WRAPPER="/usr/local/libexec/kit-ssh-wrapper"
 readonly DEPLOY_CONFIG="/etc/kit/deploy.env"
 readonly DEPLOY_USER="kit-deploy"
@@ -29,7 +30,7 @@ cleanup() {
   fi
   rm -rf -- /srv/data/apps/kit
   rm -rf -- /etc/kit
-  rm -f -- "$ACTIVATOR" "$SSH_WRAPPER"
+  rm -f -- "$ACTIVATOR" "$CORE_ACTIVATOR" "$SSH_WRAPPER"
   if (( created_user )); then
     userdel "$DEPLOY_USER" 2>/dev/null || true
   fi
@@ -72,7 +73,8 @@ install -d -o root -g root -m 0755 /srv/data/apps/kit
 install -d -o "$DEPLOY_USER" -g "$DEPLOY_USER" -m 0755 \
   "$KIT_ROOT" "$KIT_ROOT/incoming" "$KIT_ROOT/sites" "$KIT_ROOT/releases"
 install -d -o root -g root -m 0755 /usr/local/libexec /etc/kit
-install -o root -g root -m 0755 deploy/activate.sh "$ACTIVATOR"
+install -o root -g root -m 0755 deploy/activate.sh "$CORE_ACTIVATOR"
+install -o root -g root -m 0755 deploy/activate-entrypoint.sh "$ACTIVATOR"
 install -o root -g root -m 0755 deploy/ssh-wrapper.sh "$SSH_WRAPPER"
 
 tmp=$(mktemp -d)
@@ -200,6 +202,15 @@ upload() {
     "$SSH_WRAPPER" gitea <"$archive"
 }
 
+activate_direct_site() {
+  local identifier=$1 source_archive=$2 archive
+  archive="$KIT_ROOT/incoming/direct-site-$identifier.tar.gz"
+  cp "$source_archive" "$archive"
+  chown "$DEPLOY_USER:$DEPLOY_USER" "$archive"
+  chmod 0600 "$archive"
+  runuser -u "$DEPLOY_USER" -- "$ACTIVATOR" site "$identifier" "$archive"
+}
+
 rollback() {
   local kind=$1 identifier=$2
   runuser -u "$DEPLOY_USER" -- "$ACTIVATOR" rollback "$kind" "$identifier"
@@ -239,14 +250,17 @@ make_site_tree "$site1" "$commit1"
 make_site_tree "$site2" "$commit2"
 make_site_tree "$site3" "$commit3"
 
+# Direct invocation goes through the official entrypoint and must return zero
+# even though the historical core returns 1 after this exact successful state.
 sync_origin_site "$site1"
 archive1=$(make_site_archive "$site1" "$commit1")
-upload upload-site "$commit1" "$archive1"
+activate_direct_site "$commit1" "$archive1"
 assert_current_site "$commit1"
 assert_incoming_empty
 cmp -s "$KIT_ROOT/sites/$commit1/index.html" "$site1/index.html" || fail "activated site content differs"
 [[ $(stat -c '%U' "$KIT_ROOT/sites/$commit1") == "$DEPLOY_USER" ]] || fail "activated site is not owned by deploy user"
 
+# Subsequent deployment uses the full forced-command wrapper path.
 sync_origin_site "$site2"
 archive2=$(make_site_archive "$site2" "$commit2")
 upload upload-site "$commit2" "$archive2"
@@ -325,4 +339,4 @@ assert_current_release "$version1"
 assert_incoming_empty
 [[ ! -e $KIT_ROOT/releases/$version3 ]] || fail "failed release metadata verification left a release directory"
 
-echo "activate integration: forced-command site/release activation, rollback, origin failure rollback, and traversal rejection passed"
+echo "activate integration: direct entrypoint, forced-command site/release activation, rollback, origin failure rollback, and traversal rejection passed"
