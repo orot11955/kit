@@ -28,8 +28,12 @@ Repository-local commands:
   unset <key>          Remove one setting
 
 Keys:
-  git.provider  git.remote  git.stable  git.base  git.source
+  git.provider  git.remote  git.push-remote  git.stable  git.base  git.source
   git.allow-insecure-http
+
+Fork workflow:
+  Keep git.remote pointed at the upstream/base repository and set
+  git.push-remote to the fork remote used for review branches.
 `)
 		return nil
 	}
@@ -136,7 +140,7 @@ func (a *Application) printWorkflowConfig(config gitservice.WorkflowConfig, json
 	if jsonOutput {
 		return writeJSON(a.IO.Out, config)
 	}
-	fmt.Fprintf(a.IO.Out, "git.provider=%s\ngit.remote=%s\ngit.stable=%s\ngit.base=%s\ngit.source=%s\ngit.allow-insecure-http=%t\n", config.Provider, config.Remote, config.Stable, config.Base, config.Source, config.AllowInsecureHTTP)
+	fmt.Fprintf(a.IO.Out, "git.provider=%s\ngit.remote=%s\ngit.push-remote=%s\ngit.stable=%s\ngit.base=%s\ngit.source=%s\ngit.allow-insecure-http=%t\n", config.Provider, config.Remote, config.PushRemote, config.Stable, config.Base, config.Source, config.AllowInsecureHTTP)
 	return nil
 }
 
@@ -256,6 +260,14 @@ func (a *Application) doctor(ctx context.Context, global globalOptions, args []s
 		result.Provider = strings.ToLower(config.Provider)
 		result.Checks = append(result.Checks, doctorCheck{Name: "remote", OK: false, Message: remoteErr.Error()})
 		result.OK = false
+	}
+	if config.PushRemote != "" {
+		if pushURL, pushErr := service.RemoteURL(ctx, config.PushRemote); pushErr == nil {
+			result.Checks = append(result.Checks, doctorCheck{Name: "push remote", OK: true, Message: config.PushRemote + " → " + pushURL})
+		} else {
+			result.Checks = append(result.Checks, doctorCheck{Name: "push remote", OK: false, Message: pushErr.Error()})
+			result.OK = false
+		}
 	}
 	if _, err := service.IsAncestor(ctx, config.Base, config.Source); err == nil {
 		synced, _ := service.IsAncestor(ctx, config.Base, config.Source)
