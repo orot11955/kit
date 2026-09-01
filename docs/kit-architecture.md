@@ -321,7 +321,9 @@ deploy/ssh-wrapper.sh
   ↓
 /srv/data/apps/kit/data/incoming
   ↓
-root-owned /usr/local/libexec/kit-activate
+root-owned /usr/local/libexec/kit-activate       (entrypoint)
+  ↓
+root-owned /usr/local/libexec/kit-activate-core  (production core)
   ↓
 origin byte verification
   ↓
@@ -335,11 +337,26 @@ atomic current-site / current-release symlink
 - forced-command operation + identifier allowlist
 - upload byte/time limit
 - `.upload.lock` / `.deploy.lock`
-- fixed root-owned activator path
+- fixed root-owned activator entrypoint/core paths
 - archive traversal/link/special-file 거부
 - release checksum/metadata 검증
 - origin response와 activated file byte 비교
 - rollback도 같은 lock/order와 exact target 검증 사용
+
+### Activator entrypoint / core contract
+
+`deploy/activate.sh`는 production core이며 `/usr/local/libexec/kit-activate-core`로 설치한다. 공식 호출 경로 `/usr/local/libexec/kit-activate`는 `deploy/activate-entrypoint.sh`다.
+
+historical core의 `site|release` dispatch는 site activation 자체가 성공한 뒤 마지막 false release predicate 때문에 status `1`을 반환할 수 있다. entrypoint는 이 status를 일반적으로 무시하지 않고 다음 조건을 **모두** 만족하는 정확한 site success postcondition에서만 `0`으로 정규화한다.
+
+- core status가 정확히 `1`
+- mode가 `site`
+- identifier가 40-hex
+- archive가 production `incoming` 바로 아래에 있었고 이미 소비됨
+- `current-site`가 정확히 `sites/<validated-id>`를 가리킴
+- 해당 destination directory가 존재하며 symlink가 아님
+
+그 외 core failure는 원래 exit status를 그대로 전파한다. SSH wrapper와 root rollback wrapper는 모두 공식 `kit-activate` entrypoint만 호출한다.
 
 ### Privileged production-path CI
 
@@ -349,6 +366,7 @@ Ubuntu GitHub Verify는 ephemeral runner에서 실제 production constant를 사
 /srv/data/apps/kit/data
 /etc/kit/deploy.env
 /usr/local/libexec/kit-activate
+/usr/local/libexec/kit-activate-core
 kit-deploy system user
 ```
 
@@ -356,6 +374,7 @@ fixture는 `GITHUB_ACTIONS=true`, Linux, root 조건이 아니면 실행을 거�
 
 검증 범위:
 
+- official activator entrypoint의 direct site invocation exit contract
 - forced-command wrapper의 stdin archive upload
 - validated identifier가 activator까지 전달되는지
 - site activation → second activation → rollback
@@ -366,20 +385,7 @@ fixture는 `GITHUB_ACTIONS=true`, Linux, root 조건이 아니면 실행을 거�
 - release metadata mismatch rollback
 - archive consumption / symlink target / ownership postcondition
 
-`deploy/activate.sh`에는 CI 전용 path override나 test mode를 넣지 않는다.
-
-### 알려진 activator compatibility debt
-
-`activate.sh`의 historical `site|release` dispatch는 site activation 자체가 성공한 뒤 마지막 false release predicate 때문에 direct invocation에서 exit status `1`이 될 수 있다. production SSH wrapper는 이 상태를 일반적으로 무시하지 않는다.
-
-다음 조건을 **모두** 만족하는 정확한 site success postcondition일 때만 status `1`을 정상화한다.
-
-- activator status가 정확히 `1`
-- incoming archive가 소비됨
-- `current-site`가 정확히 `sites/<validated-id>`를 가리킴
-- 해당 destination directory가 존재하며 symlink가 아님
-
-그 외 activator failure는 원래 exit status를 그대로 전파한다. direct activator dispatch 자체를 정리하는 것은 별도 기술부채로 남아 있다.
+production core에는 CI 전용 path override나 test mode를 넣지 않는다.
 
 ## 16. GitHub / Gitea CI
 
@@ -460,12 +466,11 @@ main merge 후 develop을 새 main SHA로 맞출 때는 **해당 main SHA의 pus
 
 ## 19. 현재 남은 범위
 
-현재 core daily workflow, fork review, native CI, privileged deploy fixture, branch-protection desired-state 자동화는 구현되어 있다.
+현재 core daily workflow, fork review, native CI, privileged deploy fixture, activator entrypoint/core contract, branch-protection desired-state 자동화는 구현되어 있다.
 
 남은 항목은 다음과 같다.
 
 - Administration credential을 사용한 GitHub protection desired state의 **실제 repository settings 적용**
-- `activate.sh` site-mode historical direct exit-status dispatch 정리
 - 서로 다른 host 또는 GitLab/Forgejo의 cross-repository review 지원 여부 결정
 - 큰 orchestration 파일(`internal/app`)의 추가 구조 분리는 기능 변경과 분리해 점진적으로 진행
 
