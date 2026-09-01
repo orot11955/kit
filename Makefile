@@ -27,6 +27,7 @@ check:
 		deploy/rollback.sh \
 		deploy/ssh-wrapper.sh \
 		deploy/tests/ssh-wrapper.sh \
+		deploy/tests/activate-integration.sh \
 		deploy/apps-prod/deploy.sh \
 		deploy/deploy-manual.sh
 	bash deploy/tests/ssh-wrapper.sh
