@@ -30,10 +30,12 @@ check:
 		deploy/tests/activate-integration.sh \
 		deploy/apps-prod/deploy.sh \
 		deploy/deploy-manual.sh \
-		scripts/github-protection.sh
+		scripts/github-protection.sh \
+		scripts/tests/github-protection.sh
 	python3 -m json.tool .github/protection/main.json >/dev/null
 	python3 -m json.tool .github/protection/develop.json >/dev/null
 	bash deploy/tests/ssh-wrapper.sh
+	bash scripts/tests/github-protection.sh
 
 release:
 	@if [ "$(VERSION)" = "dev" ]; then \
