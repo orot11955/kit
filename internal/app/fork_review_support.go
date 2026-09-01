@@ -95,7 +95,12 @@ func findOrCreateReview(ctx context.Context, client review.Client, repositories 
 }
 
 func reviewURLMatchesRepository(reviewURL string, repository hosting.Repository) bool {
-	if strings.TrimSpace(reviewURL) == "" || strings.TrimSpace(repository.WebURL) == "" {
+	if strings.TrimSpace(repository.WebURL) == "" {
+		// Local/bare remotes are used by tests and offline workflows. There is no
+		// repository URL coordinate available to bind, so preserve legacy behavior.
+		return true
+	}
+	if strings.TrimSpace(reviewURL) == "" {
 		return false
 	}
 	base := strings.TrimSuffix(repository.WebURL, "/") + "/"
