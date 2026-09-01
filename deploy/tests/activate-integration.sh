@@ -4,6 +4,7 @@ set -Eeuo pipefail
 
 readonly KIT_ROOT="/srv/data/apps/kit/data"
 readonly ACTIVATOR="/usr/local/libexec/kit-activate"
+readonly SSH_WRAPPER="/usr/local/libexec/kit-ssh-wrapper"
 readonly DEPLOY_CONFIG="/etc/kit/deploy.env"
 readonly DEPLOY_USER="kit-deploy"
 
@@ -28,7 +29,7 @@ cleanup() {
   fi
   rm -rf -- /srv/data/apps/kit
   rm -rf -- /etc/kit
-  rm -f -- "$ACTIVATOR"
+  rm -f -- "$ACTIVATOR" "$SSH_WRAPPER"
   if (( created_user )); then
     userdel "$DEPLOY_USER" 2>/dev/null || true
   fi
@@ -72,6 +73,7 @@ install -d -o "$DEPLOY_USER" -g "$DEPLOY_USER" -m 0755 \
   "$KIT_ROOT" "$KIT_ROOT/incoming" "$KIT_ROOT/sites" "$KIT_ROOT/releases"
 install -d -o root -g root -m 0755 /usr/local/libexec /etc/kit
 install -o root -g root -m 0755 deploy/activate.sh "$ACTIVATOR"
+install -o root -g root -m 0755 deploy/ssh-wrapper.sh "$SSH_WRAPPER"
 
 tmp=$(mktemp -d)
 origin_root="$tmp/origin"
@@ -142,15 +144,22 @@ sync_origin() {
 
 make_site_archive() {
   local directory=$1 commit=$2 archive
-  archive="$KIT_ROOT/incoming/site-$commit.tar.gz"
+  archive="$tmp/upload-site-$commit.tar.gz"
   tar -C "$directory" -czf "$archive" index.html styles.css app.js favicon.svg install.sh
-  chown "$DEPLOY_USER:$DEPLOY_USER" "$archive"
-  chmod 0600 "$archive"
   printf '%s' "$archive"
 }
 
-activate() {
-  runuser -u "$DEPLOY_USER" -- "$ACTIVATOR" "$@"
+upload_site() {
+  local commit=$1 archive=$2
+  runuser -u "$DEPLOY_USER" -- env \
+    SSH_ORIGINAL_COMMAND="upload-site $commit" \
+    SSH_CONNECTION="$private_ip 54321 $private_ip 22" \
+    "$SSH_WRAPPER" gitea <"$archive"
+}
+
+rollback_site() {
+  local commit=$1
+  runuser -u "$DEPLOY_USER" -- "$ACTIVATOR" rollback site "$commit"
 }
 
 assert_current_site() {
@@ -160,6 +169,11 @@ assert_current_site() {
     fail "current-site points to $(readlink "$KIT_ROOT/current-site"), expected sites/$commit"
   [[ -d $KIT_ROOT/sites/$commit && ! -L $KIT_ROOT/sites/$commit ]] || \
     fail "site directory is missing for $commit"
+}
+
+assert_incoming_empty() {
+  [[ -z $(find "$KIT_ROOT/incoming" -mindepth 1 -maxdepth 1 -type f -print -quit) ]] || \
+    fail "wrapper left an incoming archive or origin response behind"
 }
 
 commit1=$(printf '1%.0s' {1..40})
@@ -175,33 +189,35 @@ make_site_tree "$site3" "$commit3"
 
 sync_origin "$site1"
 archive1=$(make_site_archive "$site1" "$commit1")
-activate site "$commit1" "$archive1"
+upload_site "$commit1" "$archive1"
 assert_current_site "$commit1"
-[[ ! -e $archive1 ]] || fail "successful activation did not remove the incoming archive"
+assert_incoming_empty
 cmp -s "$KIT_ROOT/sites/$commit1/index.html" "$site1/index.html" || fail "activated site content differs"
 [[ $(stat -c '%U' "$KIT_ROOT/sites/$commit1") == "$DEPLOY_USER" ]] || fail "activated site is not owned by deploy user"
 
 sync_origin "$site2"
 archive2=$(make_site_archive "$site2" "$commit2")
-activate site "$commit2" "$archive2"
+upload_site "$commit2" "$archive2"
 assert_current_site "$commit2"
+assert_incoming_empty
 
 sync_origin "$site1"
-activate rollback site "$commit1"
+rollback_site "$commit1"
 assert_current_site "$commit1"
 
-# A valid new archive must not stay active when the configured origin still
+# A valid new upload must not stay active when the configured origin still
 # serves the previous deployment. The activator should restore the old link and
-# remove the newly-created destination.
+# the forced-command wrapper should clean its incoming archive on failure.
 archive3=$(make_site_archive "$site3" "$commit3")
-if activate site "$commit3" "$archive3"; then
+if upload_site "$commit3" "$archive3"; then
   fail "origin mismatch deployment unexpectedly succeeded"
 fi
 assert_current_site "$commit1"
+assert_incoming_empty
 [[ ! -e $KIT_ROOT/sites/$commit3 ]] || fail "failed origin verification left a new site directory"
 
-# Exercise archive traversal rejection using the actual production validator.
-malicious="$KIT_ROOT/incoming/site-$commit4.tar.gz"
+# Exercise archive traversal rejection through the same forced-command path.
+malicious="$tmp/upload-site-$commit4.tar.gz"
 python3 - "$malicious" <<'PY'
 import io
 import sys
@@ -214,13 +230,12 @@ with tarfile.open(path, "w:gz") as archive:
     info.size = len(data)
     archive.addfile(info, io.BytesIO(data))
 PY
-chown "$DEPLOY_USER:$DEPLOY_USER" "$malicious"
-chmod 0600 "$malicious"
-if activate site "$commit4" "$malicious"; then
+if upload_site "$commit4" "$malicious"; then
   fail "traversal archive unexpectedly succeeded"
 fi
 assert_current_site "$commit1"
+assert_incoming_empty
 [[ ! -e $KIT_ROOT/sites/$commit4 ]] || fail "traversal archive created a site destination"
 [[ ! -e $KIT_ROOT/escape && ! -e /srv/data/apps/kit/escape ]] || fail "traversal archive escaped the staging directory"
 
-echo "activate integration: site activation, rollback, origin failure rollback, and traversal rejection passed"
+echo "activate integration: forced-command upload, site activation, rollback, origin failure rollback, and traversal rejection passed"
