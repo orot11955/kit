@@ -99,15 +99,19 @@ Compose 파일을 변경한다.
 
 ### 서버 고정 배포 script
 
-wrapper와 activator는 repository workflow가 갱신할 수 없도록 root 소유로 설치한다.
-내용을 관리자가 검토한 후에만 교체한다.
+wrapper와 activator entrypoint/core는 repository workflow가 갱신할 수 없도록 root 소유로
+설치한다. 내용을 관리자가 검토한 후에만 교체한다. `/usr/local/libexec/kit-activate`는
+운영 entrypoint이며 실제 배포 core는 `/usr/local/libexec/kit-activate-core`에 고정한다.
+entrypoint는 core의 실패를 그대로 전달하고, historical site 성공 status `1`만 exact
+postcondition이 확인될 때 `0`으로 정규화한다.
 
 ```sh
 sudo install -d -o root -g root -m 0755 /usr/local/libexec
 sudo install -d -o root -g root -m 0755 /usr/local/sbin /etc/kit
 sudo install -o root -g root -m 0644 deploy/config/deploy.env.example /etc/kit/deploy.env
 sudo editor /etc/kit/deploy.env
-sudo install -o root -g root -m 0755 deploy/activate.sh /usr/local/libexec/kit-activate
+sudo install -o root -g root -m 0755 deploy/activate.sh /usr/local/libexec/kit-activate-core
+sudo install -o root -g root -m 0755 deploy/activate-entrypoint.sh /usr/local/libexec/kit-activate
 sudo install -o root -g root -m 0755 deploy/ssh-wrapper.sh /usr/local/libexec/kit-ssh-wrapper
 sudo install -o root -g root -m 0755 deploy/rollback.sh /usr/local/sbin/kit-rollback
 sudo chown root:root /etc/kit/deploy.env
