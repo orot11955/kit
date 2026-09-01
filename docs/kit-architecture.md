@@ -41,6 +41,7 @@ internal/app
   ├─ compare / pick / sync / review
   ├─ config / auth / doctor / update
   ├─ worktree / branch-clean extensions
+  ├─ port / process extensions
   └─ user-facing rendering and mutation confirmation
 
 internal/git
@@ -56,6 +57,7 @@ internal/workflow
 
 internal/review
   ├─ Gitea API adapter
+  ├─ same-repository + Gitea fork review capabilities
   ├─ compatibility GitLab/Forgejo mapping
   ├─ secure HTTP client
   └─ review create/find/get/ping contracts
@@ -71,6 +73,9 @@ internal/auth
 
 internal/update
   └─ release metadata, download verification, install/rollback
+
+internal/procutil
+  └─ local port/process inspection and Unix signal safety
 ```
 
 `Application.Run`의 기존 contract는 유지하고, 이후 추가된 developer command/option은 `RunCLI` extension router를 사용한다. 이는 이미 큰 orchestration 파일을 더 키우지 않으면서 기존 embedding/test contract를 보존하기 위한 구조다.
@@ -102,11 +107,20 @@ git.base     = develop
 git.source   = work
 ```
 
-`kit config init`은 설정을 기록한다.
+optional fork workflow:
+
+```text
+git.remote       = upstream   # base fetch/sync + review target
+git.push-remote  = origin     # fork review branch push source
+```
+
+`git.push-remote`가 설정되지 않으면 `git.remote`로 fallback한다. 따라서 기존 same-repository workflow는 변경되지 않는다.
+
+`kit config init`은 기본 설정을 기록하며 optional `git.push-remote`를 임의로 만들지 않는다.
 
 `kit config bootstrap`은 새 clone bootstrap을 담당한다.
 
-- remote fetch
+- `git.remote` fetch
 - remote stable/base 존재 확인
 - missing local stable/base 생성
 - missing source를 base에서 생성
@@ -142,7 +156,7 @@ source queue commit이 base에 반영됐는지는 다음 순서로 판단한다.
 6. pick state 저장
 7. base에서 target branch 생성 + Kit-created marker
 8. commit별 `cherry-pick -x`
-9. push
+9. configured review push remote로 push
 10. Gitea PR create-or-reuse
 11. reviewstate 저장
 
@@ -166,7 +180,7 @@ push 시작 전 review initialization이 실패하면 original checkout으로 ro
 
 reviewstate는 다음을 저장한다.
 
-- provider / remote
+- provider / published push remote
 - source review branch / target base
 - PR number / URL / status
 - original source commit hashes
@@ -174,9 +188,34 @@ reviewstate는 다음을 저장한다.
 - merge SHA / timestamps
 - lifecycle stage
 
+### same-repository와 fork model
+
+기본 same-repository flow에서는 `git.remote`가 base sync, branch push, PR target을 모두 담당한다.
+
+Gitea fork flow에서는:
+
+```text
+git.remote       upstream target repository
+git.push-remote  fork source repository
+```
+
+로 역할을 분리한다.
+
+cross-repository review 안전 조건:
+
+- target/source provider가 모두 Gitea
+- 두 remote가 같은 Gitea host
+- source/target repository coordinate를 URL에서 해석 가능
+- provider client와 token은 upstream target repository에 바인딩
+- branch push/upstream/cleanup은 fork push remote에 바인딩
+
+Gitea create PR의 source는 `<fork-owner>:<branch>` 형태로 전달한다.
+
+saved review state의 `Remote`는 실제 published push remote를 저장한다. 이후 config의 push remote가 바뀌면 status/add/finish mutation은 중단한다. saved PR URL도 해석 가능한 target repository URL과 일치해야 provider refresh를 수행한다.
+
 ### submit
 
-`review submit`은 push 후 동일 source/base의 open PR을 먼저 찾는다. 존재하면 재사용하고 없으면 create한다. 따라서 API timeout 후 재실행이 idempotent한 방향으로 동작한다.
+`review submit`은 configured push remote로 push한 뒤 동일 source/base의 open PR을 먼저 찾는다. fork mode에서는 fork owner까지 함께 일치해야 재사용한다. 존재하면 재사용하고 없으면 create한다. 따라서 API timeout 후 재실행이 idempotent한 방향으로 동작한다.
 
 ### add
 
@@ -187,11 +226,11 @@ reviewstate는 다음을 저장한다.
 - provider PR `open`
 - Kit-created marker
 - clean tree
-- correct upstream
-- local tip == remote tip == provider source SHA == saved PublishedTip
-- base/source freshness
+- correct push-remote upstream
+- local tip == push remote tip == provider source SHA == saved PublishedTip
+- upstream base/source freshness
 
-추가 cherry-pick 중 실패하면 시작 전 branch tip으로 rollback한다. remote push 성공 후에만 state를 갱신한다.
+추가 cherry-pick 중 실패하면 시작 전 branch tip으로 rollback한다. fork mode에서도 push 성공 후에만 state를 갱신한다.
 
 ### status/list
 
@@ -206,18 +245,18 @@ reviewstate는 다음을 저장한다.
 ```text
 provider merged 확인
   ↓
-base-only fast-forward
+upstream base-only fast-forward
   ↓
 provider-confirmed source commits reconcile
   ↓
 normal Git-only sync
   ↓
-managed local/remote review branch exact-tip cleanup
+managed local + published push-remote review branch exact-tip cleanup
 ```
 
 이 provider-aware reconcile은 squash merge를 안전하게 처리하기 위한 별도 boundary다. 일반 `sync`의 Git-only contract는 유지된다.
 
-branch cleanup은 saved PublishedTip과 현재 local/remote tip이 정확히 일치할 때만 수행한다.
+branch cleanup은 saved PublishedTip과 현재 local/push-remote tip이 정확히 일치할 때만 수행한다. fork mode에서 upstream repository의 같은 이름 branch는 cleanup 대상이 아니다.
 
 자동화:
 
@@ -232,7 +271,7 @@ kit review finish <branch> --yes --json
 일반 흐름:
 
 1. clean tree 확인
-2. configured remote fetch/prune
+2. configured `git.remote` fetch/prune
 3. base remote relation 검증
 4. original base/work/checkout hash 기록
 5. base fast-forward
@@ -283,10 +322,11 @@ kit doctor --network
 
 read-only 원칙:
 
-- `git ls-remote`로 remote stable/base 조회
-- remote source absence 확인
+- `git ls-remote`로 upstream stable/base 조회
+- upstream source absence 확인
 - local remote-tracking ref를 변경하지 않음
-- Gitea authenticated repository API ping
+- Gitea authenticated target repository API ping
+- `git.push-remote`가 있으면 source/target Gitea topology 검증
 
 기본 `kit doctor`는 network를 사용하지 않는다.
 
@@ -307,7 +347,7 @@ stored credential:
 - Ubuntu: Secret Service
 - explicit fallback: permission-restricted local file
 
-review API origin은 repository origin과 exact match해야 하며 redirect도 같은 origin만 허용한다.
+review API origin은 target repository origin과 exact match해야 하며 redirect도 같은 origin만 허용한다.
 
 HTTP는 다음 조건을 모두 만족하는 Gitea에만 명시 허용한다.
 
@@ -348,7 +388,34 @@ JSON/CI/non-TTY에서는 macOS Keychain interactive unlock prompt를 자동으�
 
 remote branch는 `branch-clean`이 삭제하지 않는다. provider-confirmed remote review branch cleanup은 `review finish`에서만 수행한다.
 
-## 14. Self-update / rollback
+## 14. Port / process developer utility
+
+`kit port`는 `lsof`를 사용해 local TCP listener와 UDP binding을 조회한다.
+
+```sh
+kit port 3000
+kit port kill 3000 --signal TERM
+```
+
+`kit process`는 `ps`를 사용해 PID/PPID/user/elapsed/command를 조회하고 명시적 signal mutation을 수행한다.
+
+```sh
+kit process 1234
+kit process kill 1234 --signal TERM
+```
+
+mutation contract:
+
+- 기본 signal은 `SIGTERM`
+- TERM/KILL/INT/HUP/QUIT만 허용
+- PID <= 1 거부
+- 현재 실행 중인 kit process 거부
+- signal 전에 target 존재/권한 preflight
+- JSON mutation은 `--yes` 필수
+
+이 developer utility들은 Git repository 외부에서도 동작한다. port 조회에는 `lsof`가 필요하며 macOS에는 기본 제공되고 Ubuntu에서는 별도 설치가 필요할 수 있다.
+
+## 15. Self-update / rollback
 
 production update sequence:
 
@@ -365,7 +432,7 @@ production update sequence:
 
 `kit update --rollback`은 network 없이 previous binary를 실행·검증한 뒤 current/previous를 transactional swap한다. symlink/special file은 rollback source로 거부한다.
 
-## 15. Deploy trust boundary
+## 16. Deploy trust boundary
 
 GitHub가 upstream source이고 main/develop push는 Gitea로 mirror된다.
 
@@ -388,7 +455,7 @@ Linux CI는 production wrapper를 black-box 실행해 identity, token count, ope
 
 privileged activator의 실제 `/srv` atomic activation/rollback은 서버 trust boundary 안에 있으며 현재 GitHub unprivileged CI에서 end-to-end로 실행하지 않는다.
 
-## 16. CI
+## 17. CI
 
 GitHub Verify:
 
@@ -417,7 +484,7 @@ kit version --json execution
 
 Gitea mirror 성공 여부도 GitHub workflow에서 확인한다.
 
-## 17. Compatibility
+## 18. Compatibility
 
 다음은 compatibility namespace로 유지한다.
 
@@ -425,16 +492,16 @@ Gitea mirror 성공 여부도 GitHub workflow에서 확인한다.
 - `kit self ...`
 - legacy reviewstate provider values (`gitlab`, `forgejo`) 읽기
 - legacy `work` backup namespace는 ownership을 증명할 수 있는 기본 `work`에 한해 제한적으로 처리
+- `git.push-remote`가 없는 기존 repository는 `git.remote`를 push remote로 사용
 
 새 기능과 문서는 top-level command와 Gitea canonical workflow를 기준으로 한다.
 
-## 18. 현재 의도적으로 남겨 둔 범위
+## 19. 현재 의도적으로 남겨 둔 범위
 
-다음은 core daily workflow와 분리되어 있어 우선순위가 낮다.
+다음은 현재 core workflow 밖의 후속 범위다.
 
-- `port` / `process` 같은 범용 개발 utility
-- fork repository에서 upstream repository로 직접 PR을 만드는 별도 push/target repository 모델
-- privileged deploy activator의 CI end-to-end fixture
+- privileged deploy activator의 실제 `/srv` CI end-to-end fixture
 - GitHub repository branch protection/ruleset의 자동 설정
+- 서로 다른 host 또는 GitLab/Forgejo의 cross-repository review
 
 이 영역을 추가하더라도 Git-only sync, provider-confirmed review mutation, exact-tip cleanup, original-work rollback invariant를 깨지 않는 것이 우선이다.
