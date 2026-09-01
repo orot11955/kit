@@ -93,3 +93,11 @@ func findOrCreateReview(ctx context.Context, client review.Client, repositories 
 	created, err := client.Create(ctx, request)
 	return created, false, err
 }
+
+func reviewURLMatchesRepository(reviewURL string, repository hosting.Repository) bool {
+	if strings.TrimSpace(reviewURL) == "" || strings.TrimSpace(repository.WebURL) == "" {
+		return false
+	}
+	base := strings.TrimSuffix(repository.WebURL, "/") + "/"
+	return strings.HasPrefix(reviewURL, base)
+}
