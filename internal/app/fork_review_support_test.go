@@ -3,10 +3,13 @@ package app
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	gitservice "kit/internal/git"
 	"kit/internal/review"
+	"kit/internal/reviewstate"
 )
 
 type recordingForkReviewClient struct {
@@ -96,6 +99,48 @@ func TestFindOrCreateReviewReusesForkPR(t *testing.T) {
 	}
 	if client.createOwner != "" {
 		t.Fatalf("CreateFrom was called despite existing PR: %#v", client)
+	}
+}
+
+func TestCleanupFinishedForkReviewDeletesOnlyPushRemoteBranch(t *testing.T) {
+	dir := appRepository(t)
+	upstream := filepath.Join(t.TempDir(), "upstream.git")
+	fork := filepath.Join(t.TempDir(), "fork.git")
+	gitCommand(t, "", "init", "--bare", upstream)
+	gitCommand(t, "", "init", "--bare", fork)
+	gitCommand(t, dir, "remote", "add", "upstream", upstream)
+	gitCommand(t, dir, "remote", "add", "origin", fork)
+	gitCommand(t, dir, "branch", "work", "develop")
+	gitCommand(t, dir, "switch", "-c", "feat/fork")
+	if err := os.WriteFile(filepath.Join(dir, "fork.txt"), []byte("fork\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, dir, "add", "fork.txt")
+	gitCommand(t, dir, "commit", "-m", "fork review")
+	tip := gitCommandOutput(t, dir, "rev-parse", "HEAD")
+	gitCommand(t, dir, "push", "-u", "origin", "feat/fork")
+	gitCommand(t, dir, "push", "upstream", "feat/fork")
+	gitCommand(t, dir, "switch", "develop")
+	service := gitservice.Service{Dir: dir}
+	if err := service.MarkKitCreatedBranch(context.Background(), "feat/fork"); err != nil {
+		t.Fatal(err)
+	}
+	config := gitservice.DefaultWorkflowConfig()
+	config.Remote = "upstream"
+	config.PushRemote = "origin"
+	state := reviewstate.State{Remote: "origin", Branch: "feat/fork", PublishedTip: tip}
+	localRemoved, remoteRemoved, err := cleanupFinishedReviewBranch(context.Background(), service, config, state, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !localRemoved || !remoteRemoved {
+		t.Fatalf("expected local+fork cleanup, got local=%v remote=%v", localRemoved, remoteRemoved)
+	}
+	if commandSucceeds(fork, "show-ref", "--verify", "--quiet", "refs/heads/feat/fork") {
+		t.Fatal("fork review branch remained after cleanup")
+	}
+	if !commandSucceeds(upstream, "show-ref", "--verify", "--quiet", "refs/heads/feat/fork") {
+		t.Fatal("upstream branch with same name was incorrectly deleted")
 	}
 }
 
